@@ -71,6 +71,14 @@ class CameraSessionManager: AutoCloseable {
             Log.w(TAG, "Camera already open. Skipping openCamera call.")
             return
         }
+        
+        // Check if handler thread is in TERMINATED state (can't be restarted after being quit)
+        // A NEW thread has state NEW (not yet started), a TERMINATED thread has been quit
+        // We need to check for TERMINATED specifically, not isAlive (which is false for both NEW and TERMINATED)
+        if (handlerThread.state == Thread.State.TERMINATED) {
+            Log.e(TAG, "HandlerThread is terminated - this CameraSessionManager cannot be reused. Create a new instance.")
+            return
+        }
 
         val cameraCallback = object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
