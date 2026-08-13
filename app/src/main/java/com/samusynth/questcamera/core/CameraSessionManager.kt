@@ -143,9 +143,9 @@ class CameraSessionManager: AutoCloseable {
                 Log.i(TAG, "Capture session configured for camera $cameraId.")
                 val requestBuilder = camera.createCaptureRequest(useCase).apply {
                     surfaces.forEach { addTarget(it) }
-                    // The recorder's MediaRecorder frame-rate setting does not
-                    // throttle Camera2 input. Request a fixed 30 FPS camera
-                    // stream so the encoded video is actually 30 FPS.
+                    // Request the narrowest camera cadence available. The video
+                    // provider independently paces the latest texture onto an exact
+                    // 30 Hz encoder timeline because Quest may ignore this range.
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 30))
                 }
 
