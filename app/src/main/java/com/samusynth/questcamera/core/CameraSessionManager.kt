@@ -4,6 +4,7 @@ import android.content.Context
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.os.Handler
@@ -29,10 +30,17 @@ class CameraSessionManager: AutoCloseable {
         session?.close()
         session = null
         handlerThread.quitSafely()
-        try {
-            handlerThread.join()
-        } catch (e: InterruptedException) {
-            Log.e("HandlerThread", "Interrupted while stopping the thread", e)
+        if (Thread.currentThread() != handlerThread) {
+            try {
+                handlerThread.join()
+            } catch (e: InterruptedException) {
+                Log.e("HandlerThread", "Interrupted while stopping the thread", e)
+                Thread.currentThread().interrupt()
+            }
+        } else {
+            // Camera callbacks run on this HandlerThread. Joining the current
+            // thread would deadlock the process and prevent Unity from resuming.
+            Log.w(TAG, "Camera session closed from its handler thread; skipping self-join.")
         }
 
         Log.i(TAG, "Resources released.")
@@ -135,6 +143,10 @@ class CameraSessionManager: AutoCloseable {
                 Log.i(TAG, "Capture session configured for camera $cameraId.")
                 val requestBuilder = camera.createCaptureRequest(useCase).apply {
                     surfaces.forEach { addTarget(it) }
+                    // The recorder's MediaRecorder frame-rate setting does not
+                    // throttle Camera2 input. Request a fixed 30 FPS camera
+                    // stream so the encoded video is actually 30 FPS.
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 30))
                 }
 
                 try {

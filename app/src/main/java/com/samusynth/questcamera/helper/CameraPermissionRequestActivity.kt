@@ -18,8 +18,9 @@ class CameraPermissionRequestActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             val cameraGranted = permissions[CAMERA_PERMISSION] == true
             val headsetCameraGranted = permissions[HEADSET_CAMERA_PERMISSION] == true
+            val recordAudioGranted = permissions[RECORD_AUDIO_PERMISSION] == true
 
-            permissionResultDispatcher.dispatch(cameraGranted && headsetCameraGranted)
+            permissionResultDispatcher.dispatch(cameraGranted && headsetCameraGranted && recordAudioGranted)
             finish()
         }
 
@@ -28,7 +29,8 @@ class CameraPermissionRequestActivity : ComponentActivity() {
         requestPermissionLauncher.launch(
             arrayOf(
                 CAMERA_PERMISSION,
-                HEADSET_CAMERA_PERMISSION
+                HEADSET_CAMERA_PERMISSION,
+                RECORD_AUDIO_PERMISSION
             )
         )
     }
@@ -36,6 +38,7 @@ class CameraPermissionRequestActivity : ComponentActivity() {
     companion object {
         private const val CAMERA_PERMISSION : String = Manifest.permission.CAMERA
         private const val HEADSET_CAMERA_PERMISSION : String = "horizonos.permission.HEADSET_CAMERA"
+        private const val RECORD_AUDIO_PERMISSION : String = Manifest.permission.RECORD_AUDIO
 
         val permissionResultDispatcher = EventDispatcher<Boolean>()
 
@@ -44,7 +47,8 @@ class CameraPermissionRequestActivity : ComponentActivity() {
                 context,
                 arrayOf(
                     CAMERA_PERMISSION,
-                    HEADSET_CAMERA_PERMISSION
+                    HEADSET_CAMERA_PERMISSION,
+                    RECORD_AUDIO_PERMISSION
                 )
             )
         }
