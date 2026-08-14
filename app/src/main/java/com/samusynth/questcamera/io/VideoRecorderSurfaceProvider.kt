@@ -20,11 +20,15 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import com.samusynth.questcamera.core.ISurfaceProvider
+import java.io.BufferedWriter
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
@@ -42,6 +46,7 @@ class VideoRecorderSurfaceProvider(
     private val width: Int,
     private val height: Int,
     outputFilePath: String,
+    frameTimestampFilePath: String,
     frameRate: Int,
     bitrateMbps: Int,
     iFrameIntervalSeconds: Int,
@@ -53,9 +58,18 @@ class VideoRecorderSurfaceProvider(
         width = width,
         height = height,
         outputFilePath = outputFilePath,
-        frameRate = frameRate.coerceAtLeast(1),
+        frameTimestampFilePath = frameTimestampFilePath,
+        frameRate = frameRate.also {
+            require(it == CAPTURE_CONTRACT_FRAME_RATE) {
+                "OpenQuest capture contract requires exactly $CAPTURE_CONTRACT_FRAME_RATE FPS"
+            }
+        },
         bitrateMbps = bitrateMbps.coerceAtLeast(1),
-        iFrameIntervalSeconds = iFrameIntervalSeconds.coerceAtLeast(1),
+        iFrameIntervalSeconds = iFrameIntervalSeconds.also {
+            require(it == CAPTURE_CONTRACT_GOP_SECONDS) {
+                "OpenQuest capture contract requires a one-second GOP"
+            }
+        },
     )
 
     init {
@@ -69,7 +83,14 @@ class VideoRecorderSurfaceProvider(
 
     override fun getSurface(): Surface = pipeline.cameraInputSurface
 
-    fun updateOutputFile(path: String) = pipeline.updateOutputFile(path)
+    override fun onCaptureResult(
+        frameNumber: Long,
+        sensorTimestampNs: Long,
+        exposureTimeNs: Long,
+    ) = pipeline.onCaptureResult(frameNumber, sensorTimestampNs, exposureTimeNs)
+
+    fun updateOutputFile(path: String, frameTimestampPath: String) =
+        pipeline.updateOutputFiles(path, frameTimestampPath)
 
     fun startRecording() = pipeline.startRecording()
 
@@ -78,6 +99,8 @@ class VideoRecorderSurfaceProvider(
     override fun close() = pipeline.close()
 
     companion object {
+        private const val CAPTURE_CONTRACT_FRAME_RATE = 30
+        private const val CAPTURE_CONTRACT_GOP_SECONDS = 1
         private const val TAG = "VideoRecorderSurfaceProvider"
     }
 }
@@ -86,12 +109,14 @@ private class FixedFrameRateVideoPipeline(
     private val width: Int,
     private val height: Int,
     outputFilePath: String,
+    frameTimestampFilePath: String,
     private val frameRate: Int,
     private val bitrateMbps: Int,
     private val iFrameIntervalSeconds: Int,
 ) : AutoCloseable {
     private val stateLock = Any()
     private var outputFile = File(outputFilePath)
+    private var frameTimestampFile = File(frameTimestampFilePath)
     private val workerThread = HandlerThread("FixedRateVideo-$width-$height").apply { start() }
     private val worker = Handler(workerThread.looper)
 
@@ -107,6 +132,10 @@ private class FixedFrameRateVideoPipeline(
         private set
     private val textureTransform = FloatArray(16)
     private var hasCameraFrame = false
+    @Volatile
+    private var latestCameraFrame: CameraFrameTimestamp? = null
+    private val captureResults = ConcurrentHashMap<Long, CameraFrameTimestamp>()
+    private val captureResultOrder = ConcurrentLinkedQueue<Long>()
 
     private var shaderProgram = 0
     private var positionLocation = -1
@@ -125,6 +154,9 @@ private class FixedFrameRateVideoPipeline(
     private var writtenFrameCount = 0L
     private var recordingStartNs = 0L
     private var nextFrameTargetNs = 0L
+    private val submittedFrameTimestamps = ArrayDeque<CameraFrameTimestamp>()
+    private var frameTimestampWriter: BufferedWriter? = null
+    private var lastWrittenSensorTimestampNs = Long.MIN_VALUE
 
     @Volatile
     private var isRecording = false
@@ -169,10 +201,32 @@ private class FixedFrameRateVideoPipeline(
         }
     }
 
-    fun updateOutputFile(path: String) = synchronized(stateLock) {
+    fun onCaptureResult(frameNumber: Long, sensorTimestampNs: Long, exposureTimeNs: Long) {
+        if (sensorTimestampNs < 0L || isClosed) return
+        val sample = CameraFrameTimestamp(
+            captureFrameNumber = frameNumber,
+            sensorTimestampNs = sensorTimestampNs,
+            exposureTimeNs = exposureTimeNs,
+            surfaceTimestampNs = sensorTimestampNs,
+        )
+        captureResults[sensorTimestampNs] = sample
+        captureResultOrder.add(sensorTimestampNs)
+        while (true) {
+            val oldest = captureResultOrder.peek() ?: break
+            if (captureResults.containsKey(oldest)) break
+            captureResultOrder.poll()
+        }
+        while (captureResults.size > MAX_CAPTURE_RESULTS) {
+            val expired = captureResultOrder.poll() ?: break
+            captureResults.remove(expired)
+        }
+    }
+
+    fun updateOutputFiles(path: String, frameTimestampPath: String) = synchronized(stateLock) {
         check(!isClosed) { "Video pipeline is closed" }
         check(!isRecording) { "Cannot change video output while recording" }
         outputFile = File(path)
+        frameTimestampFile = File(frameTimestampPath)
         runOnWorkerBlocking("prepare fixed-rate recording output") {
             prepareEncoder(outputFile)
         }
@@ -191,6 +245,11 @@ private class FixedFrameRateVideoPipeline(
             }
             submittedFrameCount = 0L
             writtenFrameCount = 0L
+            submittedFrameTimestamps.clear()
+            lastWrittenSensorTimestampNs = Long.MIN_VALUE
+            latestCameraFrame = null
+            hasCameraFrame = false
+            openFrameTimestampWriter(frameTimestampFile)
             recordingStartNs = System.nanoTime()
             nextFrameTargetNs = recordingStartNs
             isRecording = true
@@ -209,7 +268,11 @@ private class FixedFrameRateVideoPipeline(
             try {
                 codec?.signalEndOfInputStream()
                 drainEncoder(endOfStream = true)
+                check(submittedFrameTimestamps.isEmpty()) {
+                    "Encoder finalized with ${submittedFrameTimestamps.size} unmatched frame timestamps"
+                }
             } finally {
+                closeFrameTimestampWriter()
                 releaseEncoderAndMuxer()
             }
             Log.i(TAG, "Stopped fixed-rate recording after $writtenFrameCount frames")
@@ -306,6 +369,14 @@ private class FixedFrameRateVideoPipeline(
                     makeCurrent(pbufferSurface)
                     availableTexture.updateTexImage()
                     availableTexture.getTransformMatrix(textureTransform)
+                    val surfaceTimestampNs = availableTexture.timestamp
+                    val capture = captureResults.remove(surfaceTimestampNs)
+                    latestCameraFrame = CameraFrameTimestamp(
+                        captureFrameNumber = capture?.captureFrameNumber ?: UNKNOWN_FRAME_NUMBER,
+                        sensorTimestampNs = capture?.sensorTimestampNs ?: surfaceTimestampNs,
+                        exposureTimeNs = capture?.exposureTimeNs ?: UNKNOWN_EXPOSURE_NS,
+                        surfaceTimestampNs = surfaceTimestampNs,
+                    )
                     hasCameraFrame = true
                 } catch (failure: Throwable) {
                     if (!isClosed) Log.e(TAG, "Unable to consume camera texture", failure)
@@ -359,6 +430,7 @@ private class FixedFrameRateVideoPipeline(
 
     private fun renderEncoderFrame() {
         val activeCodec = codec ?: error("Encoder is not prepared")
+        val cameraFrame = latestCameraFrame ?: return
         check(encoderEglSurface != EGL14.EGL_NO_SURFACE) { "Encoder EGL surface is unavailable" }
 
         if (submittedFrameCount % gopFrameCount == 0L) {
@@ -389,6 +461,7 @@ private class FixedFrameRateVideoPipeline(
             "eglPresentationTimeANDROID failed"
         }
         check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
+        submittedFrameTimestamps.addLast(cameraFrame)
         submittedFrameCount++
         makeCurrent(pbufferSurface)
     }
@@ -424,6 +497,13 @@ private class FixedFrameRateVideoPipeline(
 
                     if (bufferInfo.size > 0) {
                         check(muxerStarted) { "Encoded sample arrived before muxer format" }
+                        val isSyncFrame =
+                            bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+                        val expectedSyncFrame = writtenFrameCount % gopFrameCount == 0L
+                        check(isSyncFrame == expectedSyncFrame) {
+                            "Encoder violated fixed GOP $gopFrameCount at frame " +
+                                "$writtenFrameCount (sync=$isSyncFrame)"
+                        }
                         outputBuffer.position(bufferInfo.offset)
                         outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
@@ -432,6 +512,9 @@ private class FixedFrameRateVideoPipeline(
                         // timestamp quantization performed by the hardware encoder.
                         bufferInfo.presentationTimeUs = writtenFrameCount * 1_000_000L / frameRate
                         muxer?.writeSampleData(muxerTrackIndex, outputBuffer, bufferInfo)
+                        val frameTimestamp = submittedFrameTimestamps.pollFirst()
+                            ?: error("Encoded sample has no source exposure timestamp")
+                        writeFrameTimestamp(writtenFrameCount, frameTimestamp)
                         writtenFrameCount++
                     }
 
@@ -444,6 +527,7 @@ private class FixedFrameRateVideoPipeline(
     }
 
     private fun releaseEncoderAndMuxer() {
+        closeFrameTimestampWriter()
         if (encoderEglSurface != EGL14.EGL_NO_SURFACE && eglDisplay != EGL14.EGL_NO_DISPLAY) {
             makeCurrent(pbufferSurface)
             EGL14.eglDestroySurface(eglDisplay, encoderEglSurface)
@@ -466,6 +550,7 @@ private class FixedFrameRateVideoPipeline(
         muxer = null
         muxerStarted = false
         muxerTrackIndex = -1
+        submittedFrameTimestamps.clear()
     }
 
     private fun releaseGl() {
@@ -477,6 +562,9 @@ private class FixedFrameRateVideoPipeline(
         surfaceTexture?.release()
         surfaceTexture = null
         hasCameraFrame = false
+        latestCameraFrame = null
+        captureResults.clear()
+        captureResultOrder.clear()
 
         if (shaderProgram != 0) GLES20.glDeleteProgram(shaderProgram)
         if (externalTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(externalTextureId), 0)
@@ -574,6 +662,36 @@ private class FixedFrameRateVideoPipeline(
                 position(0)
             }
 
+    private fun openFrameTimestampWriter(file: File) {
+        closeFrameTimestampWriter()
+        file.parentFile?.mkdirs()
+        frameTimestampWriter = file.bufferedWriter().also { writer ->
+            writer.write(FRAME_TIMESTAMP_HEADER)
+            writer.newLine()
+        }
+    }
+
+    private fun writeFrameTimestamp(index: Long, frame: CameraFrameTimestamp) {
+        val writer = frameTimestampWriter ?: error("Frame timestamp writer is not open")
+        val duplicate = frame.sensorTimestampNs == lastWrittenSensorTimestampNs
+        writer.write(
+            "$index,${frame.sensorTimestampNs},${frame.exposureTimeNs}," +
+                "${frame.captureFrameNumber},${frame.surfaceTimestampNs},$duplicate"
+        )
+        writer.newLine()
+        lastWrittenSensorTimestampNs = frame.sensorTimestampNs
+    }
+
+    private fun closeFrameTimestampWriter() {
+        frameTimestampWriter?.let { writer ->
+            runCatching {
+                writer.flush()
+                writer.close()
+            }.onFailure { Log.e(TAG, "Unable to finalize frame timestamp sidecar", it) }
+        }
+        frameTimestampWriter = null
+    }
+
     private fun runOnWorkerBlocking(operation: String, block: () -> Unit) {
         if (Thread.currentThread() === workerThread) {
             block()
@@ -604,6 +722,12 @@ private class FixedFrameRateVideoPipeline(
         private const val WORKER_TIMEOUT_SECONDS = 15L
         private const val EOS_TIMEOUT_MS = 5_000L
         private const val EOS_DEQUEUE_TIMEOUT_US = 10_000L
+        private const val MAX_CAPTURE_RESULTS = 240
+        private const val UNKNOWN_FRAME_NUMBER = -1L
+        private const val UNKNOWN_EXPOSURE_NS = -1L
+        private const val FRAME_TIMESTAMP_HEADER =
+            "encoded_frame_index,sensor_timestamp_ns,exposure_time_ns," +
+                "capture_frame_number,surface_timestamp_ns,is_duplicate"
 
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
@@ -627,3 +751,10 @@ private class FixedFrameRateVideoPipeline(
         """
     }
 }
+
+private data class CameraFrameTimestamp(
+    val captureFrameNumber: Long,
+    val sensorTimestampNs: Long,
+    val exposureTimeNs: Long,
+    val surfaceTimestampNs: Long,
+)

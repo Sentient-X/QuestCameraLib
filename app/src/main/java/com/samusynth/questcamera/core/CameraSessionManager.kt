@@ -4,7 +4,9 @@ import android.content.Context
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.os.Handler
@@ -149,8 +151,35 @@ class CameraSessionManager: AutoCloseable {
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 30))
                 }
 
+                val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult,
+                    ) {
+                        val sensorTimestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                        if (sensorTimestampNs == null) {
+                            Log.e(TAG, "Camera $cameraId capture result has no SENSOR_TIMESTAMP")
+                            return
+                        }
+                        val exposureTimeNs =
+                            result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: UNKNOWN_EXPOSURE_NS
+                        targetSurfaceProviders.forEach { provider ->
+                            provider.onCaptureResult(
+                                frameNumber = result.frameNumber,
+                                sensorTimestampNs = sensorTimestampNs,
+                                exposureTimeNs = exposureTimeNs,
+                            )
+                        }
+                    }
+                }
+
                 try {
-                    session.setRepeatingRequest(requestBuilder.build(), null, null)
+                    session.setRepeatingRequest(
+                        requestBuilder.build(),
+                        captureCallback,
+                        Handler(handlerThread.looper),
+                    )
                     this@CameraSessionManager.session = session
                     Log.i(TAG, "Repeating request started for camera $cameraId.")
                 } catch (e: Exception) {
@@ -183,5 +212,6 @@ class CameraSessionManager: AutoCloseable {
 
     companion object {
         private val TAG = CameraSessionManager::class.java.simpleName
+        private const val UNKNOWN_EXPOSURE_NS = -1L
     }
 }
