@@ -13,7 +13,6 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
-import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -31,16 +30,16 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
 
 /**
  * Camera2 surface provider backed by a fixed-rate MediaCodec/EGL pipeline.
  *
- * Quest camera frames arrive on a 50 Hz timestamp lattice even when Camera2 is
- * requested at 30 FPS. Camera2 therefore targets a SurfaceTexture rather than
- * the encoder directly. The EGL worker samples the latest texture at exactly
- * [frameRate], duplicating or dropping camera frames as needed, and writes an
- * exact n/frameRate presentation timeline into the MP4.
+ * Camera2 is requested at 30 FPS, but some Quest camera modes ignore that
+ * request and expose at a higher rate. Camera2 therefore targets a
+ * SurfaceTexture rather than the encoder directly. The EGL worker passes an
+ * observed 30 Hz source through or selects fresh exposures from a faster
+ * source, never manufactures a duplicate, and writes an exact n/frameRate
+ * presentation timeline into the MP4.
  */
 class VideoRecorderSurfaceProvider(
     private val width: Int,
@@ -94,7 +93,15 @@ class VideoRecorderSurfaceProvider(
 
     fun startRecording() = pipeline.startRecording()
 
+    fun requestStopRecording() = pipeline.requestStopRecording()
+
     fun stopRecording() = pipeline.stopRecording()
+
+    fun getSourceFrameCount(): Long = pipeline.sourceFrameCount()
+
+    fun getSourceDroppedFrameCount(): Long = pipeline.sourceDroppedFrameCount()
+
+    fun getSelectedFrameCount(): Long = pipeline.selectedFrameCount()
 
     override fun close() = pipeline.close()
 
@@ -131,11 +138,14 @@ private class FixedFrameRateVideoPipeline(
     lateinit var cameraInputSurface: Surface
         private set
     private val textureTransform = FloatArray(16)
-    private var hasCameraFrame = false
-    @Volatile
-    private var latestCameraFrame: CameraFrameTimestamp? = null
     private val captureResults = ConcurrentHashMap<Long, CameraFrameTimestamp>()
     private val captureResultOrder = ConcurrentLinkedQueue<Long>()
+    private val captureStatsLock = Any()
+    private var sourceFrameCount = 0L
+    private var sourceDroppedFrameCount = 0L
+    private var previousSourceFrameNumber: Long? = null
+    private var sourceSequenceError: String? = null
+    private val recentSourceTimestampsNs = ArrayDeque<Long>()
 
     private var shaderProgram = 0
     private var positionLocation = -1
@@ -152,48 +162,23 @@ private class FixedFrameRateVideoPipeline(
     private val bufferInfo = MediaCodec.BufferInfo()
     private var submittedFrameCount = 0L
     private var writtenFrameCount = 0L
-    private var recordingStartNs = 0L
-    private var nextFrameTargetNs = 0L
-    private val submittedFrameTimestamps = ArrayDeque<CameraFrameTimestamp>()
+    private val exposureSelector = ExposureFrameSelector(frameRate)
+    private val submittedFrameTimestamps = ArrayDeque<Long>()
+    private val pendingFrameTimestampRows = ArrayDeque<PendingFrameTimestampRow>()
     private var frameTimestampWriter: BufferedWriter? = null
     private var lastWrittenSensorTimestampNs = Long.MIN_VALUE
+    private var captureFailure: Throwable? = null
 
     @Volatile
     private var isRecording = false
     @Volatile
+    private var recordingSessionActive = false
+    @Volatile
+    private var captureStatsActive = false
+    @Volatile
     private var isClosed = false
 
-    private val framePeriodNs = 1_000_000_000L / frameRate
     private val gopFrameCount = frameRate * iFrameIntervalSeconds
-
-    private val frameTick = object : Runnable {
-        override fun run() {
-            if (!isRecording || isClosed) return
-
-            try {
-                var nowNs = System.nanoTime()
-                var renderedThisTick = 0
-
-                // Catch up if Android scheduled this worker late. A small cap avoids
-                // starving SurfaceTexture callbacks while preserving elapsed duration.
-                while (hasCameraFrame && nowNs >= nextFrameTargetNs && renderedThisTick < 3) {
-                    renderEncoderFrame()
-                    nextFrameTargetNs = recordingStartNs + submittedFrameCount * framePeriodNs
-                    renderedThisTick++
-                    nowNs = System.nanoTime()
-                }
-
-                drainEncoder(endOfStream = false)
-
-                val delayNs = max(0L, nextFrameTargetNs - System.nanoTime())
-                worker.postDelayed(this, max(1L, delayNs / 1_000_000L))
-            } catch (failure: Throwable) {
-                Log.e(TAG, "Fixed-rate encoder frame tick failed", failure)
-                isRecording = false
-                releaseEncoderAndMuxer()
-            }
-        }
-    }
 
     init {
         runOnWorkerBlocking("initialize EGL camera surface") {
@@ -203,6 +188,35 @@ private class FixedFrameRateVideoPipeline(
 
     fun onCaptureResult(frameNumber: Long, sensorTimestampNs: Long, exposureTimeNs: Long) {
         if (sensorTimestampNs < 0L || isClosed) return
+        synchronized(captureStatsLock) {
+            val latestTimestampNs = recentSourceTimestampsNs.peekLast()
+            if (latestTimestampNs == null || sensorTimestampNs > latestTimestampNs) {
+                recentSourceTimestampsNs.addLast(sensorTimestampNs)
+                while (recentSourceTimestampsNs.size > SOURCE_RATE_WINDOW_FRAMES) {
+                    recentSourceTimestampsNs.removeFirst()
+                }
+            }
+        }
+        if (captureStatsActive) {
+            synchronized(captureStatsLock) {
+                if (captureStatsActive) {
+                    previousSourceFrameNumber?.let { previous ->
+                        when {
+                            frameNumber <= previous -> {
+                                sourceSequenceError =
+                                    "Camera2 capture frame numbers did not increase: " +
+                                        "$previous -> $frameNumber"
+                            }
+                            frameNumber > previous + 1L -> {
+                                sourceDroppedFrameCount += frameNumber - previous - 1L
+                            }
+                        }
+                    }
+                    previousSourceFrameNumber = frameNumber
+                    sourceFrameCount++
+                }
+            }
+        }
         val sample = CameraFrameTimestamp(
             captureFrameNumber = frameNumber,
             sensorTimestampNs = sensorTimestampNs,
@@ -220,6 +234,7 @@ private class FixedFrameRateVideoPipeline(
             val expired = captureResultOrder.poll() ?: break
             captureResults.remove(expired)
         }
+        worker.post { flushFrameTimestampRows(requireAll = false) }
     }
 
     fun updateOutputFiles(path: String, frameTimestampPath: String) = synchronized(stateLock) {
@@ -234,7 +249,7 @@ private class FixedFrameRateVideoPipeline(
 
     fun startRecording() = synchronized(stateLock) {
         check(!isClosed) { "Video pipeline is closed" }
-        if (isRecording) return@synchronized
+        if (recordingSessionActive) return@synchronized
 
         val recordingFile = outputFile
         runOnWorkerBlocking("start fixed-rate recording") {
@@ -246,32 +261,80 @@ private class FixedFrameRateVideoPipeline(
             submittedFrameCount = 0L
             writtenFrameCount = 0L
             submittedFrameTimestamps.clear()
+            pendingFrameTimestampRows.clear()
             lastWrittenSensorTimestampNs = Long.MIN_VALUE
-            latestCameraFrame = null
-            hasCameraFrame = false
+            captureFailure = null
+            val observedSourceRateHz = observedSourceRateHz()
+            val passThroughSource =
+                observedSourceRateHz == null || observedSourceRateHz <= PASS_THROUGH_SOURCE_MAX_HZ
+            exposureSelector.reset(passThroughSource = passThroughSource)
+            captureResults.clear()
+            captureResultOrder.clear()
+            synchronized(captureStatsLock) {
+                sourceFrameCount = 0L
+                sourceDroppedFrameCount = 0L
+                previousSourceFrameNumber = null
+                sourceSequenceError = null
+                captureStatsActive = true
+            }
             openFrameTimestampWriter(frameTimestampFile)
-            recordingStartNs = System.nanoTime()
-            nextFrameTargetNs = recordingStartNs
+            recordingSessionActive = true
             isRecording = true
-            worker.removeCallbacks(frameTick)
-            worker.post(frameTick)
-            Log.i(TAG, "Started ${width}x${height} H.264 at fixed $frameRate FPS: ${recordingFile.absolutePath}")
+            val sourceMode = if (passThroughSource) "pass-through" else "rate-select"
+            val sourceRate = observedSourceRateHz?.let { "%.3f Hz".format(it) } ?: "unknown"
+            Log.i(
+                TAG,
+                "Started ${width}x${height} H.264 at fixed $frameRate FPS " +
+                    "($sourceMode from $sourceRate source): ${recordingFile.absolutePath}",
+            )
         }
     }
 
+    fun requestStopRecording() = synchronized(stateLock) {
+        if (!recordingSessionActive) return@synchronized
+        isRecording = false
+    }
+
+    fun sourceFrameCount(): Long = synchronized(captureStatsLock) { sourceFrameCount }
+
+    fun sourceDroppedFrameCount(): Long =
+        synchronized(captureStatsLock) { sourceDroppedFrameCount }
+
+    fun selectedFrameCount(): Long = writtenFrameCount
+
+    private fun observedSourceRateHz(): Double? = synchronized(captureStatsLock) {
+        if (recentSourceTimestampsNs.size < MIN_SOURCE_RATE_WINDOW_FRAMES) {
+            return@synchronized null
+        }
+        val durationNs = recentSourceTimestampsNs.last() - recentSourceTimestampsNs.first()
+        if (durationNs <= 0L) return@synchronized null
+        (recentSourceTimestampsNs.size - 1L) * NANOS_PER_SECOND.toDouble() / durationNs
+    }
+
     fun stopRecording() = synchronized(stateLock) {
-        if (!isRecording) return@synchronized
+        if (!recordingSessionActive) return@synchronized
+        isRecording = false
 
         runOnWorkerBlocking("stop fixed-rate recording") {
-            isRecording = false
-            worker.removeCallbacks(frameTick)
             try {
                 codec?.signalEndOfInputStream()
                 drainEncoder(endOfStream = true)
                 check(submittedFrameTimestamps.isEmpty()) {
                     "Encoder finalized with ${submittedFrameTimestamps.size} unmatched frame timestamps"
                 }
+                flushFrameTimestampRows(requireAll = true)
+                check(pendingFrameTimestampRows.isEmpty()) {
+                    "Encoder finalized with ${pendingFrameTimestampRows.size} unresolved Camera2 rows"
+                }
+                check(sourceSequenceError == null) { sourceSequenceError.orEmpty() }
+                captureFailure?.let { throw IllegalStateException("Camera exposure capture failed", it) }
+                val quality = exposureSelector.requireDeliveryQuality()
+                check(quality.frameCount == writtenFrameCount) {
+                    "Selected ${quality.frameCount} exposures but encoded $writtenFrameCount frames"
+                }
             } finally {
+                captureStatsActive = false
+                recordingSessionActive = false
                 closeFrameTimestampWriter()
                 releaseEncoderAndMuxer()
             }
@@ -282,7 +345,7 @@ private class FixedFrameRateVideoPipeline(
     override fun close() = synchronized(stateLock) {
         if (isClosed) return@synchronized
 
-        if (isRecording) {
+        if (recordingSessionActive) {
             stopRecording()
         }
 
@@ -370,16 +433,16 @@ private class FixedFrameRateVideoPipeline(
                     availableTexture.updateTexImage()
                     availableTexture.getTransformMatrix(textureTransform)
                     val surfaceTimestampNs = availableTexture.timestamp
-                    val capture = captureResults.remove(surfaceTimestampNs)
-                    latestCameraFrame = CameraFrameTimestamp(
-                        captureFrameNumber = capture?.captureFrameNumber ?: UNKNOWN_FRAME_NUMBER,
-                        sensorTimestampNs = capture?.sensorTimestampNs ?: surfaceTimestampNs,
-                        exposureTimeNs = capture?.exposureTimeNs ?: UNKNOWN_EXPOSURE_NS,
-                        surfaceTimestampNs = surfaceTimestampNs,
-                    )
-                    hasCameraFrame = true
+                    if (isRecording && exposureSelector.select(surfaceTimestampNs)) {
+                        renderEncoderFrame(surfaceTimestampNs)
+                    }
+                    if (isRecording) drainEncoder(endOfStream = false)
                 } catch (failure: Throwable) {
-                    if (!isClosed) Log.e(TAG, "Unable to consume camera texture", failure)
+                    if (!isClosed) {
+                        captureFailure = failure
+                        isRecording = false
+                        Log.e(TAG, "Unable to select and encode camera exposure", failure)
+                    }
                 }
             }, worker)
         }
@@ -428,16 +491,14 @@ private class FixedFrameRateVideoPipeline(
         }
     }
 
-    private fun renderEncoderFrame() {
-        val activeCodec = codec ?: error("Encoder is not prepared")
-        val cameraFrame = latestCameraFrame ?: return
+    private fun renderEncoderFrame(surfaceTimestampNs: Long) {
+        check(codec != null) { "Encoder is not prepared" }
         check(encoderEglSurface != EGL14.EGL_NO_SURFACE) { "Encoder EGL surface is unavailable" }
 
-        if (submittedFrameCount % gopFrameCount == 0L) {
-            activeCodec.setParameters(Bundle().apply {
-                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-            })
-        }
+        // KEY_I_FRAME_INTERVAL owns the one-second GOP. Do not also request sync
+        // frames here: racing the codec's automatic IDR with a per-frame manual
+        // request can yield a second adjacent IDR, which correctly trips the
+        // fixed-GOP validator below and truncates only that eye.
 
         makeCurrent(encoderEglSurface)
         GLES20.glViewport(0, 0, width, height)
@@ -456,12 +517,12 @@ private class FixedFrameRateVideoPipeline(
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-        val presentationNs = submittedFrameCount * framePeriodNs
+        val presentationNs = submittedFrameCount * 1_000_000_000L / frameRate
         check(EGLExt.eglPresentationTimeANDROID(eglDisplay, encoderEglSurface, presentationNs)) {
             "eglPresentationTimeANDROID failed"
         }
         check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
-        submittedFrameTimestamps.addLast(cameraFrame)
+        submittedFrameTimestamps.addLast(surfaceTimestampNs)
         submittedFrameCount++
         makeCurrent(pbufferSurface)
     }
@@ -512,10 +573,13 @@ private class FixedFrameRateVideoPipeline(
                         // timestamp quantization performed by the hardware encoder.
                         bufferInfo.presentationTimeUs = writtenFrameCount * 1_000_000L / frameRate
                         muxer?.writeSampleData(muxerTrackIndex, outputBuffer, bufferInfo)
-                        val frameTimestamp = submittedFrameTimestamps.pollFirst()
+                        val surfaceTimestampNs = submittedFrameTimestamps.pollFirst()
                             ?: error("Encoded sample has no source exposure timestamp")
-                        writeFrameTimestamp(writtenFrameCount, frameTimestamp)
+                        pendingFrameTimestampRows.addLast(
+                            PendingFrameTimestampRow(writtenFrameCount, surfaceTimestampNs),
+                        )
                         writtenFrameCount++
+                        flushFrameTimestampRows(requireAll = false)
                     }
 
                     val reachedEos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -551,6 +615,7 @@ private class FixedFrameRateVideoPipeline(
         muxerStarted = false
         muxerTrackIndex = -1
         submittedFrameTimestamps.clear()
+        pendingFrameTimestampRows.clear()
     }
 
     private fun releaseGl() {
@@ -561,8 +626,6 @@ private class FixedFrameRateVideoPipeline(
         cameraInputSurface.release()
         surfaceTexture?.release()
         surfaceTexture = null
-        hasCameraFrame = false
-        latestCameraFrame = null
         captureResults.clear()
         captureResultOrder.clear()
 
@@ -671,12 +734,39 @@ private class FixedFrameRateVideoPipeline(
         }
     }
 
+    private fun flushFrameTimestampRows(requireAll: Boolean) {
+        if (frameTimestampWriter == null || pendingFrameTimestampRows.isEmpty()) return
+        val deadlineMs = SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS
+        while (pendingFrameTimestampRows.isNotEmpty()) {
+            val pending = pendingFrameTimestampRows.first()
+            val capture = captureResults.remove(pending.surfaceTimestampNs)
+            if (capture == null) {
+                if (!requireAll) return
+                check(SystemClock.uptimeMillis() < deadlineMs) {
+                    "No Camera2 capture result for encoded exposure " +
+                        "${pending.surfaceTimestampNs} ns at frame ${pending.index}"
+                }
+                Thread.sleep(1L)
+                continue
+            }
+            check(capture.sensorTimestampNs == pending.surfaceTimestampNs) {
+                "Camera2 result timestamp does not match its SurfaceTexture exposure"
+            }
+            writeFrameTimestamp(pending.index, capture)
+            pendingFrameTimestampRows.removeFirst()
+        }
+    }
+
     private fun writeFrameTimestamp(index: Long, frame: CameraFrameTimestamp) {
         val writer = frameTimestampWriter ?: error("Frame timestamp writer is not open")
-        val duplicate = frame.sensorTimestampNs == lastWrittenSensorTimestampNs
+        check(frame.captureFrameNumber >= 0L) { "Camera2 capture frame number is unavailable" }
+        check(frame.exposureTimeNs > 0L) { "Camera2 exposure duration is unavailable" }
+        check(frame.sensorTimestampNs > lastWrittenSensorTimestampNs) {
+            "Selected Camera2 exposure timestamps did not strictly increase"
+        }
         writer.write(
             "$index,${frame.sensorTimestampNs},${frame.exposureTimeNs}," +
-                "${frame.captureFrameNumber},${frame.surfaceTimestampNs},$duplicate"
+                "${frame.captureFrameNumber},${frame.surfaceTimestampNs},false"
         )
         writer.newLine()
         lastWrittenSensorTimestampNs = frame.sensorTimestampNs
@@ -722,9 +812,12 @@ private class FixedFrameRateVideoPipeline(
         private const val WORKER_TIMEOUT_SECONDS = 15L
         private const val EOS_TIMEOUT_MS = 5_000L
         private const val EOS_DEQUEUE_TIMEOUT_US = 10_000L
+        private const val CAPTURE_RESULT_TIMEOUT_MS = 500L
         private const val MAX_CAPTURE_RESULTS = 240
-        private const val UNKNOWN_FRAME_NUMBER = -1L
-        private const val UNKNOWN_EXPOSURE_NS = -1L
+        private const val SOURCE_RATE_WINDOW_FRAMES = 60
+        private const val MIN_SOURCE_RATE_WINDOW_FRAMES = 10
+        private const val PASS_THROUGH_SOURCE_MAX_HZ = 35.0
+        private const val NANOS_PER_SECOND = 1_000_000_000L
         private const val FRAME_TIMESTAMP_HEADER =
             "encoded_frame_index,sensor_timestamp_ns,exposure_time_ns," +
                 "capture_frame_number,surface_timestamp_ns,is_duplicate"
@@ -756,5 +849,10 @@ private data class CameraFrameTimestamp(
     val captureFrameNumber: Long,
     val sensorTimestampNs: Long,
     val exposureTimeNs: Long,
+    val surfaceTimestampNs: Long,
+)
+
+private data class PendingFrameTimestampRow(
+    val index: Long,
     val surfaceTimestampNs: Long,
 )
