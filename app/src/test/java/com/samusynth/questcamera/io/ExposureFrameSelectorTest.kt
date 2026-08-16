@@ -24,6 +24,66 @@ class ExposureFrameSelectorTest {
     }
 
     @Test
+    fun twoSelectorsOnTheSharedLatticeSelectIdenticalTimestamps() {
+        // Quest 3S at [60,60]: both cameras on one 20 ms lattice, identical
+        // SENSOR_TIMESTAMPs. Each eye owns its own selector; both must agree.
+        val lattice = twentyMillisecondLattice(originNs = 7_654_321_000L, count = 501)
+        val leftEye = ExposureFrameSelector(frameRate = 30)
+        val rightEye = ExposureFrameSelector(frameRate = 30)
+
+        val leftSelected = lattice.filter(leftEye::select)
+        val rightSelected = lattice.filter(rightEye::select)
+
+        assertEquals(leftSelected, rightSelected)
+        // 10 s of lattice crosses exactly 300 bin edges wherever it starts.
+        assertEquals(301, leftSelected.size)
+    }
+
+    @Test
+    fun selectsThreeOfFiveLatticeSlotsWithTwentyFortyFortyGapsAtThirtyHertz() {
+        val selector = ExposureFrameSelector(frameRate = 30)
+        val selected = twentyMillisecondLattice(originNs = 1_000_000_000L, count = 501)
+            .filter(selector::select)
+        val gaps = selected.zipWithNext { earlier, later -> later - earlier }
+
+        assertEquals(301, selected.size)
+        assertEquals(setOf(20_000_000L, 40_000_000L), gaps.toSet())
+        // Every consecutive triple of gaps is one 100 ms cycle: 20 + 40 + 40.
+        gaps.windowed(size = 3, step = 3).forEach { cycle ->
+            assertEquals(cycle.toString(), 100_000_000L, cycle.sum())
+            assertEquals(cycle.toString(), listOf(20_000_000L, 40_000_000L, 40_000_000L), cycle.sorted())
+        }
+        assertEquals(30.0, requireNotNull(selector.qualityOrNull()).meanRateHz, 0.001)
+    }
+
+    @Test
+    fun selectorStartedMidLatticePicksTheSameAbsoluteSlotsAsOneStartedAtTheOrigin() {
+        val lattice = twentyMillisecondLattice(originNs = 1_000_000_000L, count = 200)
+        val fromOrigin = ExposureFrameSelector(frameRate = 30)
+        val originSelected = lattice.filter(fromOrigin::select)
+
+        for (startSlot in 1 until 10) {
+            val lateStarter = ExposureFrameSelector(frameRate = 30)
+            val lateSelected = lattice.drop(startSlot).filter(lateStarter::select)
+
+            // The first frame after start is always taken (a recording begins
+            // mid-bin without knowing it); every later pick is the absolute
+            // grid's, exactly as chosen from the origin.
+            assertEquals(lattice[startSlot], lateSelected.first())
+            assertEquals(
+                "start slot $startSlot",
+                originSelected.filter { it > lateSelected.first() },
+                lateSelected.drop(1),
+            )
+        }
+    }
+
+    @Test
+    fun exposesTheNominalGridPeriod() {
+        assertEquals(33_333_333L, ExposureFrameSelector(frameRate = 30).gridPeriodNs)
+    }
+
+    @Test
     fun passesEveryFreshExposureFromObservedThirtyHertzSource() {
         val selector = ExposureFrameSelector(frameRate = 30)
         selector.reset(passThroughSource = true)
@@ -88,4 +148,8 @@ class ExposureFrameSelectorTest {
             selector.select(999_000_000L)
         }
     }
+
+    /** The Quest 3S source at [60,60]: 50 fps, one SENSOR_TIMESTAMP every 20 ms. */
+    private fun twentyMillisecondLattice(originNs: Long, count: Int): List<Long> =
+        List(count) { originNs + it * 20_000_000L }
 }

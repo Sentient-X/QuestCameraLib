@@ -18,6 +18,7 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import com.samusynth.questcamera.core.CameraSessionManager
 import com.samusynth.questcamera.core.ISurfaceProvider
 import java.io.BufferedWriter
 import java.io.File
@@ -33,11 +34,13 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Camera2 surface provider backed by a fixed-rate MediaCodec/EGL pipeline.
  *
- * Camera2 is requested at 30 FPS, but some Quest camera modes ignore that
- * request and expose at a higher rate. Camera2 therefore targets a
+ * Camera2 is requested at [CameraSessionManager.SOURCE_FPS_RANGE] ([60,60]);
+ * the Quest 3S HAL answers with 50 fps on one 20 ms lattice shared by both
+ * cameras, whose SENSOR_TIMESTAMPs are identical. Camera2 therefore targets a
  * SurfaceTexture rather than the encoder directly. The EGL worker passes an
- * observed 30 Hz source through or selects fresh exposures from a faster
- * source, never manufactures a duplicate, and writes an exact n/frameRate
+ * observed ≤35 Hz source through, or selects the first fresh exposure in each
+ * absolute 1/frameRate bin of the sensor clock (so both eyes encode the same
+ * instants), never manufactures a duplicate, and writes an exact n/frameRate
  * presentation timeline into the MP4.
  *
  * Bookkeeping never stops the encoder: every encoded frame gets a sidecar row
@@ -160,6 +163,9 @@ private class FixedFrameRateVideoPipeline(
     private var timestampRegressionCount = 0L
     private var selectedMeanRateHz = 0.0
     private var selectedMaxGapNs = 0L
+    // Fixed at start: the source cadence observed then, and the selection mode it chose.
+    private var observedSourceRateHz: Double? = null
+    private var passThroughSource = false
 
     private var shaderProgram = 0
     private var positionLocation = -1
@@ -265,9 +271,9 @@ private class FixedFrameRateVideoPipeline(
             submittedFrameTimestamps.clear()
             pendingFrameTimestampRows.clear()
             captureFailure = null
-            val observedSourceRateHz = observedSourceRateHz()
-            val passThroughSource =
-                observedSourceRateHz == null || observedSourceRateHz <= PASS_THROUGH_SOURCE_MAX_HZ
+            val sourceRateHz = measureSourceRateHz()
+            observedSourceRateHz = sourceRateHz
+            passThroughSource = sourceRateHz == null || sourceRateHz <= PASS_THROUGH_SOURCE_MAX_HZ
             exposureSelector.reset(passThroughSource = passThroughSource)
             // Results that arrived just before start may belong to frames the
             // SurfaceTexture delivers after start; they are retained by age.
@@ -287,12 +293,11 @@ private class FixedFrameRateVideoPipeline(
             openFrameTimestampWriter(frameTimestampFile)
             recordingSessionActive = true
             isRecording = true
-            val sourceMode = if (passThroughSource) "pass-through" else "rate-select"
-            val sourceRate = observedSourceRateHz?.let { "%.3f Hz".format(it) } ?: "unknown"
+            val sourceRate = sourceRateHz?.let { "%.3f Hz".format(it) } ?: "unknown"
             Log.i(
                 TAG,
                 "Started ${width}x${height} H.264 at fixed $frameRate FPS " +
-                    "($sourceMode from $sourceRate source): ${recordingFile.absolutePath}",
+                    "(${selectionMode()} from $sourceRate source): ${recordingFile.absolutePath}",
             )
         }
     }
@@ -313,7 +318,14 @@ private class FixedFrameRateVideoPipeline(
         val (sequenceErrors, exposureMissing) = synchronized(captureStatsLock) {
             sourceSequenceErrorCount to exposureMissingCount
         }
+        val fpsRange = CameraSessionManager.SOURCE_FPS_RANGE
+        val observedSourceFps = observedSourceRateHz
+            ?.let { "%.4f".format(java.util.Locale.ROOT, it) } ?: "null"
         return "{" +
+            "\"requested_fps_range\":[${fpsRange.lower},${fpsRange.upper}]," +
+            "\"observed_source_fps\":$observedSourceFps," +
+            "\"selection_mode\":\"${selectionMode()}\"," +
+            "\"selection_grid_ns\":${exposureSelector.gridPeriodNs}," +
             "\"exposure_missing_frame_count\":$exposureMissing," +
             "\"capture_result_missing_frame_count\":$captureResultMissingCount," +
             "\"source_sequence_error_count\":$sequenceErrors," +
@@ -324,7 +336,10 @@ private class FixedFrameRateVideoPipeline(
             "}"
     }
 
-    private fun observedSourceRateHz(): Double? = synchronized(captureStatsLock) {
+    /** Wire name of the selector mode chosen at start; the same word appears in the start log. */
+    private fun selectionMode(): String = if (passThroughSource) "pass_through" else "absolute_grid"
+
+    private fun measureSourceRateHz(): Double? = synchronized(captureStatsLock) {
         if (recentSourceTimestampsNs.size < MIN_SOURCE_RATE_WINDOW_FRAMES) {
             return@synchronized null
         }

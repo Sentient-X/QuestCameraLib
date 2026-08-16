@@ -12,6 +12,7 @@ import android.hardware.camera2.params.SessionConfiguration
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.util.Range
 import com.samusynth.questcamera.helper.CameraPermissionRequestActivity
 import java.util.concurrent.Executors
 
@@ -145,10 +146,7 @@ class CameraSessionManager: AutoCloseable {
                 Log.i(TAG, "Capture session configured for camera $cameraId.")
                 val requestBuilder = camera.createCaptureRequest(useCase).apply {
                     surfaces.forEach { addTarget(it) }
-                    // Request the narrowest camera cadence available. The video
-                    // provider independently paces the latest texture onto an exact
-                    // 30 Hz encoder timeline because Quest may ignore this range.
-                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 30))
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, SOURCE_FPS_RANGE)
                 }
 
                 val captureCallback = object : CameraCaptureSession.CaptureCallback() {
@@ -213,5 +211,19 @@ class CameraSessionManager: AutoCloseable {
     companion object {
         private val TAG = CameraSessionManager::class.java.simpleName
         private const val UNKNOWN_EXPOSURE_NS = -1L
+
+        /**
+         * CONTROL_AE_TARGET_FPS_RANGE on every repeating request. The Quest 3S
+         * passthrough cameras advertise only [15,15], [30,30] and [60,60]
+         * (probed 2026-08-16). At [30,30] the HAL keeps 3 of every 5 slots of a
+         * 20 ms lattice, decimated independently per camera, so index-paired
+         * left/right frames are 20 ms apart about half the time. At [60,60] it
+         * delivers 50 fps — every 20 ms slot — with the two cameras' SENSOR_TIMESTAMPs
+         * identical to the nanosecond, at the same ~6 ms exposure. The video
+         * provider selects its 30 Hz from that shared lattice on the sensor clock
+         * and records this range in its capture report.
+         */
+        @JvmField
+        val SOURCE_FPS_RANGE: Range<Int> = Range(60, 60)
     }
 }
