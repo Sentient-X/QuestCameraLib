@@ -273,7 +273,10 @@ private class FixedFrameRateVideoPipeline(
             captureFailure = null
             val sourceRateHz = measureSourceRateHz()
             observedSourceRateHz = sourceRateHz
-            passThroughSource = sourceRateHz == null || sourceRateHz <= PASS_THROUGH_SOURCE_MAX_HZ
+            // An unmeasured source is not a slow one: the session requests
+            // SOURCE_FPS_RANGE (a 50 Hz lattice), so unknown selects onto the
+            // absolute grid rather than encoding every slot on the n/30 timeline.
+            passThroughSource = sourceRateHz != null && sourceRateHz <= PASS_THROUGH_SOURCE_MAX_HZ
             exposureSelector.reset(passThroughSource = passThroughSource)
             // Results that arrived just before start may belong to frames the
             // SurfaceTexture delivers after start; they are retained by age.
