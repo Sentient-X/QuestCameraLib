@@ -56,30 +56,16 @@ internal class ExposureFrameSelector(private val frameRate: Int) {
         return true
     }
 
-    fun quality(): ExposureSelectionQuality {
-        require(selectedFrameCount >= 2L) {
-            "Selected camera timeline has fewer than two exposures"
-        }
+    /** Measured cadence of the selected timeline, or null before two exposures were selected. */
+    fun qualityOrNull(): ExposureSelectionQuality? {
+        if (selectedFrameCount < 2L) return null
         val durationNs = lastSelectedTimestampNs - firstSelectedTimestampNs
-        require(durationNs > 0L) { "Selected camera timeline has a non-positive duration" }
+        if (durationNs <= 0L) return null
         return ExposureSelectionQuality(
             frameCount = selectedFrameCount,
             meanRateHz = (selectedFrameCount - 1L) * NANOS_PER_SECOND.toDouble() / durationNs,
             maxGapNs = maxSelectedGapNs,
         )
-    }
-
-    fun requireDeliveryQuality(): ExposureSelectionQuality {
-        val quality = quality()
-        require(quality.meanRateHz in MIN_DELIVERED_FPS..MAX_DELIVERED_FPS) {
-            "Selected exposure cadence is %.3f Hz, expected 30 Hz".format(quality.meanRateHz)
-        }
-        require(quality.maxGapNs <= MAX_DELIVERED_EXPOSURE_GAP_NS) {
-            "Selected exposure gap is %.3f ms, maximum is 50 ms".format(
-                quality.maxGapNs / 1_000_000.0,
-            )
-        }
-        return quality
     }
 
     private fun recordSelection(sensorTimestampNs: Long) {
@@ -95,8 +81,5 @@ internal class ExposureFrameSelector(private val frameRate: Int) {
     companion object {
         private const val NO_TIMESTAMP = -1L
         private const val NANOS_PER_SECOND = 1_000_000_000L
-        private const val MIN_DELIVERED_FPS = 29.0
-        private const val MAX_DELIVERED_FPS = 31.0
-        private const val MAX_DELIVERED_EXPOSURE_GAP_NS = 50_000_000L
     }
 }
