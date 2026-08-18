@@ -1,5 +1,6 @@
 package com.samusynth.questcamera.core
 
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import kotlinx.serialization.Serializable
@@ -34,7 +35,14 @@ data class CameraMetadata(
     val pose: Pose? = null,
     val intrinsics: Intrinsics? = null,
     val distortion: List<Float>?,
-    val sensor: Sensor? = null
+    val sensor: Sensor? = null,
+    /**
+     * The SurfaceTexture output sizes the camera lists
+     * (SCALER_STREAM_CONFIGURATION_MAP); null when the map is absent. A
+     * SurfaceTexture asked for any other size is silently rounded by the camera
+     * service, so a recorder must only request one of these.
+     */
+    val outputSizes: List<IntSize>?,
 ) {
     val isPassthroughCamera: Boolean
         get() = cameraSource == 0
@@ -228,6 +236,7 @@ fun getCameraMetaData(
     val sensor = extractSensor(characteristics)
 
     val distortion = characteristics.get(CameraCharacteristics.LENS_DISTORTION)
+    val outputSizes = extractOutputSizes(characteristics)
 
     return CameraMetadata(
         cameraId = cameraId,
@@ -238,6 +247,17 @@ fun getCameraMetaData(
         pose = pose,
         intrinsics = intrinsics,
         distortion = distortion?.toList(),
-        sensor = sensor
+        sensor = sensor,
+        outputSizes = outputSizes,
     )
+}
+
+/** The listed SurfaceTexture output sizes, in the order the HAL reports them. */
+fun extractOutputSizes(
+    characteristics: CameraCharacteristics
+): List<IntSize>? {
+    val configurationMap =
+        characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+    return configurationMap.getOutputSizes(SurfaceTexture::class.java)
+        ?.map { size -> IntSize(width = size.width, height = size.height) }
 }

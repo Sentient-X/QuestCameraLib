@@ -48,10 +48,21 @@ import java.util.concurrent.atomic.AtomicReference
  * Camera2 frame number are enrichment joined from the TotalCaptureResult when
  * the HAL delivered one, and written as -1 (unknown) with a counter otherwise.
  * Only encoder/EGL failures end a recording early.
+ *
+ * Geometry (capture contract 1.4.3): Camera2 is asked for the *source* stream
+ * size — the SurfaceTexture default buffer size, which the caller must pick
+ * from the camera's listed output sizes, because the camera service silently
+ * rounds an unlisted size to its nearest listed one — and the encoder runs at
+ * the *output* size. The full-quad draw resamples the whole source into the
+ * output, isotropically when the two aspects match; the caller guarantees the
+ * match. [getStreamGeometryJson] states the sizes and the SurfaceTexture
+ * transform for the metadata sidecar.
  */
 class VideoRecorderSurfaceProvider(
-    private val width: Int,
-    private val height: Int,
+    private val sourceWidth: Int,
+    private val sourceHeight: Int,
+    private val outputWidth: Int,
+    private val outputHeight: Int,
     outputFilePath: String,
     frameTimestampFilePath: String,
     frameRate: Int,
@@ -62,8 +73,10 @@ class VideoRecorderSurfaceProvider(
     audioSamplingRate: Int,
 ) : ISurfaceProvider, AutoCloseable {
     private val pipeline = FixedFrameRateVideoPipeline(
-        width = width,
-        height = height,
+        sourceWidth = sourceWidth,
+        sourceHeight = sourceHeight,
+        outputWidth = outputWidth,
+        outputHeight = outputHeight,
         outputFilePath = outputFilePath,
         frameTimestampFilePath = frameTimestampFilePath,
         frameRate = frameRate.also {
@@ -114,6 +127,16 @@ class VideoRecorderSurfaceProvider(
     /** JSON object of capture-quality counters for the recording metadata sidecar. */
     fun getCaptureReportJson(): String = pipeline.captureReportJson()
 
+    /**
+     * JSON object of the stream geometry for the recording metadata sidecar:
+     * `requested_stream_size` (what Camera2 was asked for), `source_stream_size`
+     * (the SurfaceTexture default buffer size — the same value by construction,
+     * written so the sidecar states it), `output_size` (the encoder) and
+     * `texture_transform` (the first SurfaceTexture transform matrix, 16 floats
+     * column-major, or null when no frame has arrived).
+     */
+    fun getStreamGeometryJson(): String = pipeline.streamGeometryJson()
+
     override fun close() = pipeline.close()
 
     companion object {
@@ -124,18 +147,35 @@ class VideoRecorderSurfaceProvider(
 }
 
 private class FixedFrameRateVideoPipeline(
-    private val width: Int,
-    private val height: Int,
+    private val sourceWidth: Int,
+    private val sourceHeight: Int,
+    private val outputWidth: Int,
+    private val outputHeight: Int,
     outputFilePath: String,
     frameTimestampFilePath: String,
     private val frameRate: Int,
     private val bitrateMbps: Int,
     private val iFrameIntervalSeconds: Int,
 ) : AutoCloseable {
+    init {
+        // Checked before any thread or EGL resource exists, so a refused geometry
+        // leaks nothing.
+        require(sourceWidth > 0 && sourceHeight > 0 && outputWidth > 0 && outputHeight > 0) {
+            "Stream sizes must be positive: source ${sourceWidth}x${sourceHeight}, " +
+                "output ${outputWidth}x${outputHeight}"
+        }
+        require(sourceWidth.toLong() * outputHeight == sourceHeight.toLong() * outputWidth) {
+            "The encoder output must resample the source isotropically: " +
+                "source ${sourceWidth}x${sourceHeight}, output ${outputWidth}x${outputHeight}"
+        }
+    }
+
     private val stateLock = Any()
     private var outputFile = File(outputFilePath)
     private var frameTimestampFile = File(frameTimestampFilePath)
-    private val workerThread = HandlerThread("FixedRateVideo-$width-$height").apply { start() }
+    private val workerThread =
+        HandlerThread("FixedRateVideo-${sourceWidth}x${sourceHeight}-to-${outputWidth}x${outputHeight}")
+            .apply { start() }
     private val worker = Handler(workerThread.looper)
 
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -149,6 +189,9 @@ private class FixedFrameRateVideoPipeline(
     lateinit var cameraInputSurface: Surface
         private set
     private val textureTransform = FloatArray(16)
+    // The first SurfaceTexture transform seen, copied once and kept for the sidecar.
+    @Volatile
+    private var firstTextureTransform: FloatArray? = null
     private val captureResults = ConcurrentHashMap<Long, CameraFrameTimestamp>()
     private val captureStatsLock = Any()
     private var sourceFrameCount = 0L
@@ -299,7 +342,8 @@ private class FixedFrameRateVideoPipeline(
             val sourceRate = sourceRateHz?.let { "%.3f Hz".format(it) } ?: "unknown"
             Log.i(
                 TAG,
-                "Started ${width}x${height} H.264 at fixed $frameRate FPS " +
+                "Started ${sourceWidth}x${sourceHeight} -> ${outputWidth}x${outputHeight} H.264 " +
+                    "at fixed $frameRate FPS " +
                     "(${selectionMode()} from $sourceRate source): ${recordingFile.absolutePath}",
             )
         }
@@ -336,6 +380,18 @@ private class FixedFrameRateVideoPipeline(
             "\"gop_violation_count\":$gopViolationCount," +
             "\"selected_mean_fps\":${"%.4f".format(java.util.Locale.ROOT, selectedMeanRateHz)}," +
             "\"selected_max_gap_ns\":$selectedMaxGapNs" +
+            "}"
+    }
+
+    fun streamGeometryJson(): String {
+        val transformJson = firstTextureTransform
+            ?.joinToString(prefix = "[", postfix = "]") { it.toString() }
+            ?: "null"
+        return "{" +
+            "\"requested_stream_size\":{\"width\":$sourceWidth,\"height\":$sourceHeight}," +
+            "\"source_stream_size\":{\"width\":$sourceWidth,\"height\":$sourceHeight}," +
+            "\"output_size\":{\"width\":$outputWidth,\"height\":$outputHeight}," +
+            "\"texture_transform\":$transformJson" +
             "}"
     }
 
@@ -464,13 +520,18 @@ private class FixedFrameRateVideoPipeline(
         )
 
         surfaceTexture = SurfaceTexture(externalTextureId).also { texture ->
-            texture.setDefaultBufferSize(width, height)
+            // The Camera2 stream size. Must be one the camera lists, or the
+            // camera service rounds it and the buffer content is a crop.
+            texture.setDefaultBufferSize(sourceWidth, sourceHeight)
             texture.setOnFrameAvailableListener({ availableTexture ->
                 if (isClosed) return@setOnFrameAvailableListener
                 try {
                     makeCurrent(pbufferSurface)
                     availableTexture.updateTexImage()
                     availableTexture.getTransformMatrix(textureTransform)
+                    if (firstTextureTransform == null) {
+                        firstTextureTransform = textureTransform.copyOf()
+                    }
                     val surfaceTimestampNs = availableTexture.timestamp
                     if (isRecording && selectExposure(surfaceTimestampNs)) {
                         renderEncoderFrame(surfaceTimestampNs)
@@ -495,7 +556,11 @@ private class FixedFrameRateVideoPipeline(
         releaseEncoderAndMuxer()
         recordingFile.parentFile?.mkdirs()
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        val format = MediaFormat.createVideoFormat(
+            MediaFormat.MIMETYPE_VIDEO_AVC,
+            outputWidth,
+            outputHeight,
+        ).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateMbps * 1_000_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
@@ -542,8 +607,10 @@ private class FixedFrameRateVideoPipeline(
         // request can yield a second adjacent IDR, which correctly trips the
         // fixed-GOP validator below and truncates only that eye.
 
+        // The whole source texture onto the whole encoder surface: an isotropic
+        // resample, since the constructor requires equal aspects.
         makeCurrent(encoderEglSurface)
-        GLES20.glViewport(0, 0, width, height)
+        GLES20.glViewport(0, 0, outputWidth, outputHeight)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(shaderProgram)
