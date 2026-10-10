@@ -1,6 +1,5 @@
 package com.samusynth.questcamera.pod
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Log
 import java.io.File
@@ -10,8 +9,9 @@ import java.security.MessageDigest
 
 /**
  * The facts a headset pod reports about itself to libsx_rig: where its machine credential
- * lives, its serial, its tailnet address, and the content identity of the installed capture
- * app. Every getter answers "" when the fact is unavailable; the caller decides whether that
+ * lives, its tailnet address, and the content identity of the installed capture app. Not its
+ * serial: apps cannot read ro.serialno on the Quest 3S (measured), so provisioning writes it
+ * into pod_config.json over adb. Every getter answers "" when the fact is unavailable; the caller decides whether that
  * refuses anything.
  */
 object PodIdentity {
@@ -26,21 +26,6 @@ object PodIdentity {
     /** The app-private files directory (`/data/user/0/<package>/files`), never shared storage. */
     @JvmStatic
     fun privateFilesDir(context: Context): String = context.filesDir.absolutePath
-
-    /** `ro.serialno` (the serial adb shows), or "" when the platform withholds it from apps. */
-    @JvmStatic
-    @SuppressLint("PrivateApi")
-    fun headsetSerial(): String {
-        for (key in listOf("ro.serialno", "ro.boot.serialno")) {
-            val value = runCatching {
-                Class.forName("android.os.SystemProperties")
-                    .getMethod("get", String::class.java)
-                    .invoke(null, key) as String
-            }.getOrNull()?.trim().orEmpty()
-            if (value.isNotEmpty() && value != "unknown") return value
-        }
-        return ""
-    }
 
     /** The IPv4 address in Tailscale's 100.64.0.0/10 range on any up interface, or "". */
     @JvmStatic
