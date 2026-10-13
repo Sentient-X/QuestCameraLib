@@ -5,6 +5,8 @@
 <resources>
     <!-- UVC wrist camera 32e4:9230 -->
     <usb-device vendor-id="13028" product-id="37424" />
+    <!-- Sonix UVC test camera 05a3:9230 (bench) -->
+    <usb-device vendor-id="1443" product-id="37424" />
     <!-- Espressif 303a:* (ESP32-C6 gripper encoders) -->
     <usb-device vendor-id="12346" />
 </resources>

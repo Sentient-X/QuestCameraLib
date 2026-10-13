@@ -11,6 +11,8 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import android.hardware.usb.UsbConstants
+import com.samusynth.questcamera.helper.CameraPermissionRequestActivity
 
 /**
  * Opens the rig's USB devices — the UVC wrist cameras and the ESP32-C6 gripper encoders —
@@ -82,7 +84,11 @@ class RigUsbBridge(context: Context) : AutoCloseable {
             val key = keyOf(device)
             if (key in open) continue
             if (!usbManager.hasPermission(device)) {
-                if (permissionRequested.add(key)) requestPermission(device)
+                // Horizon OS silently denies a video-class device's permission without CAMERA +
+                // USB_CAMERA; asking before they are granted would spend the one request.
+                val blocked = isVideoDevice(device) &&
+                    !CameraPermissionRequestActivity.hasUsbCameraPermissions(appContext)
+                if (!blocked && permissionRequested.add(key)) requestPermission(device)
                 continue
             }
             val connection = usbManager.openDevice(device)
@@ -142,6 +148,7 @@ class RigUsbBridge(context: Context) : AutoCloseable {
                 "\"serial\":${held.serial?.let(::quote) ?: "null"}}"
         }
         return "{\"devices\":$devices,\"present\":${present.size}," +
+            "\"usbCameraPermission\":${CameraPermissionRequestActivity.hasUsbCameraPermissions(appContext)}," +
             "\"awaitingPermission\":${awaiting.joinToString(",", "[", "]") { quote(it) }}," +
             "\"pendingRelease\":${gone.keys.joinToString(",", "[", "]") { quote(it) }}," +
             "\"error\":${lastError?.let(::quote) ?: "null"}}"
@@ -154,13 +161,24 @@ class RigUsbBridge(context: Context) : AutoCloseable {
         /** UVC wrist camera. */
         const val WRIST_CAMERA_VENDOR_ID = 0x32E4
         const val WRIST_CAMERA_PRODUCT_ID = 0x9230
+        /** Sonix UVC test camera used on the bench. */
+        const val TEST_CAMERA_VENDOR_ID = 0x05A3
+        const val TEST_CAMERA_PRODUCT_ID = 0x9230
         /** Espressif (ESP32-C6 gripper encoders, any product id). */
         const val ESPRESSIF_VENDOR_ID = 0x303A
 
         @JvmStatic
         fun isRigDevice(vendorId: Int, productId: Int): Boolean =
             (vendorId == WRIST_CAMERA_VENDOR_ID && productId == WRIST_CAMERA_PRODUCT_ID) ||
+                (vendorId == TEST_CAMERA_VENDOR_ID && productId == TEST_CAMERA_PRODUCT_ID) ||
                 vendorId == ESPRESSIF_VENDOR_ID
+
+        /** A device with a video-class interface (a UVC camera). */
+        private fun isVideoDevice(device: UsbDevice): Boolean =
+            device.deviceClass == UsbConstants.USB_CLASS_VIDEO ||
+                (0 until device.interfaceCount).any {
+                    device.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_VIDEO
+                }
 
         /**
          * One attachment: the bus path plus Android's per-attachment device id, so a device
