@@ -10,7 +10,6 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
-import androidx.core.content.ContextCompat
 import android.hardware.usb.UsbConstants
 import com.samusynth.questcamera.helper.CameraPermissionRequestActivity
 
@@ -62,7 +61,17 @@ class RigUsbBridge(context: Context) : AutoCloseable {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
             addAction(ACTION_USB_PERMISSION)
         }
-        ContextCompat.registerReceiver(appContext, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+        // Not ContextCompat.registerReceiver: it needs androidx.core 1.9, and the Unity app
+        // resolves an older core (appcompat 1.5.1), where the call is a NoSuchMethodError that
+        // left the bridge unconstructed on the 3S. The platform overload with flags exists from
+        // API 26; RECEIVER_EXPORTED is required from API 33 for a receiver that also hears
+        // system broadcasts.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            appContext.registerReceiver(receiver, filter)
+        }
     }
 
     /**
