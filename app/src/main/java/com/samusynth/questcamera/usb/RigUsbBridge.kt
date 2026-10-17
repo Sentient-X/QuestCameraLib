@@ -170,16 +170,12 @@ class RigUsbBridge(context: Context) : AutoCloseable {
         /** UVC wrist camera. */
         const val WRIST_CAMERA_VENDOR_ID = 0x32E4
         const val WRIST_CAMERA_PRODUCT_ID = 0x9230
-        /** Sonix UVC test camera used on the bench. */
-        const val TEST_CAMERA_VENDOR_ID = 0x05A3
-        const val TEST_CAMERA_PRODUCT_ID = 0x9230
         /** Espressif (ESP32-C6 gripper encoders, any product id). */
         const val ESPRESSIF_VENDOR_ID = 0x303A
 
         @JvmStatic
         fun isRigDevice(vendorId: Int, productId: Int): Boolean =
             (vendorId == WRIST_CAMERA_VENDOR_ID && productId == WRIST_CAMERA_PRODUCT_ID) ||
-                (vendorId == TEST_CAMERA_VENDOR_ID && productId == TEST_CAMERA_PRODUCT_ID) ||
                 vendorId == ESPRESSIF_VENDOR_ID
 
         /** A device with a video-class interface (a UVC camera). */
