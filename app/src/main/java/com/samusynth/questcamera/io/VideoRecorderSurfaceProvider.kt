@@ -119,6 +119,14 @@ class VideoRecorderSurfaceProvider(
 
     fun startRecording() = pipeline.startRecording()
 
+    /** Pod setup's Scan QR: decode QR codes from this camera's frames while not recording. */
+    fun startQrScan() = pipeline.startQrScan()
+
+    fun stopQrScan() = pipeline.stopQrScan()
+
+    /** The first QR text decoded since [startQrScan], or "" (null does not cross JNI cleanly). */
+    fun getQrResult(): String = pipeline.qrResult() ?: ""
+
     fun requestStopRecording() = pipeline.requestStopRecording()
 
     fun stopRecording() = pipeline.stopRecording()
@@ -541,6 +549,7 @@ private class FixedFrameRateVideoPipeline(
                         renderEncoderFrame(surfaceTimestampNs)
                     }
                     if (isRecording) drainEncoder(endOfStream = false)
+                    else if (qrScanActive) grabQrFrame()
                 } catch (failure: Throwable) {
                     // Only encoder/EGL failures reach here; sidecar bookkeeping is
                     // counted, never thrown.
@@ -743,9 +752,107 @@ private class FixedFrameRateVideoPipeline(
         pendingFrameTimestampRows.clear()
     }
 
+    // ── QR scan (pod setup): only while not recording, at most every QR_SCAN_INTERVAL_MS ──
+
+    @Volatile
+    private var qrScanActive = false
+    @Volatile
+    private var qrResult: String? = null
+    @Volatile
+    private var qrDecoding = false
+    private var lastQrGrabMs = 0L
+    private var qrFramebuffer = 0
+    private var qrTexture = 0
+    private val qrDecoder = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private lateinit var qrTexCoordBuffer: FloatBuffer
+
+    fun startQrScan() {
+        qrResult = null
+        qrScanActive = true
+    }
+
+    fun stopQrScan() {
+        qrScanActive = false
+    }
+
+    /** The first QR text decoded since [startQrScan], or null. */
+    fun qrResult(): String? = qrResult
+
+    /**
+     * Renders the centre of the camera frame (where a phone held up shows its code) at
+     * QR_SCAN_SIZE into an offscreen texture, reads it back and decodes it off this thread.
+     * Never runs while recording, so the recorder's cadence is untouched.
+     */
+    private fun grabQrFrame() {
+        val now = SystemClock.uptimeMillis()
+        if (qrDecoding || qrResult != null || now - lastQrGrabMs < QR_SCAN_INTERVAL_MS) return
+        lastQrGrabMs = now
+        if (qrFramebuffer == 0) {
+            val ids = IntArray(1)
+            GLES20.glGenTextures(1, ids, 0)
+            qrTexture = ids[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, qrTexture)
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, QR_SCAN_SIZE, QR_SCAN_SIZE, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glGenFramebuffers(1, ids, 0)
+            qrFramebuffer = ids[0]
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, qrFramebuffer)
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, qrTexture, 0)
+            check(GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                "QR framebuffer incomplete"
+            }
+            val lo = 0.5f - QR_SCAN_CROP / 2f
+            val hi = 0.5f + QR_SCAN_CROP / 2f
+            qrTexCoordBuffer = floatBufferOf(lo, lo, hi, lo, lo, hi, hi, hi)
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, qrFramebuffer)
+        GLES20.glViewport(0, 0, QR_SCAN_SIZE, QR_SCAN_SIZE)
+        GLES20.glUseProgram(shaderProgram)
+        vertexBuffer.position(0)
+        qrTexCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(positionLocation)
+        GLES20.glVertexAttribPointer(positionLocation, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+        GLES20.glEnableVertexAttribArray(texCoordLocation)
+        GLES20.glVertexAttribPointer(texCoordLocation, 2, GLES20.GL_FLOAT, false, 0, qrTexCoordBuffer)
+        GLES20.glUniformMatrix4fv(texMatrixLocation, 1, false, textureTransform, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        val pixels = ByteBuffer.allocateDirect(QR_SCAN_SIZE * QR_SCAN_SIZE * 4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(0, 0, QR_SCAN_SIZE, QR_SCAN_SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        val rgba = ByteArray(pixels.capacity())
+        pixels.position(0)
+        pixels.get(rgba)
+        qrDecoding = true
+        qrDecoder.execute {
+            try {
+                QrDecoder.decode(rgba, QR_SCAN_SIZE, QR_SCAN_SIZE)?.let { text ->
+                    if (qrScanActive && qrResult == null) {
+                        qrResult = text
+                        Log.i(TAG, "QR code decoded (${text.length} chars)")
+                    }
+                }
+            } catch (failure: Throwable) {
+                Log.w(TAG, "QR decode failed", failure)
+            } finally {
+                qrDecoding = false
+            }
+        }
+    }
+
     private fun releaseGl() {
         if (eglDisplay == EGL14.EGL_NO_DISPLAY) return
         makeCurrent(pbufferSurface)
+        qrScanActive = false
+        qrDecoder.shutdownNow()
+        if (qrFramebuffer != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(qrFramebuffer), 0)
+        if (qrTexture != 0) GLES20.glDeleteTextures(1, intArrayOf(qrTexture), 0)
+        qrFramebuffer = 0
+        qrTexture = 0
 
         surfaceTexture?.setOnFrameAvailableListener(null)
         cameraInputSurface.release()
@@ -992,6 +1099,10 @@ private class FixedFrameRateVideoPipeline(
         private const val MIN_SOURCE_RATE_WINDOW_FRAMES = 10
         private const val PASS_THROUGH_SOURCE_MAX_HZ = 35.0
         private const val NANOS_PER_SECOND = 1_000_000_000L
+        // QR scan: the centre 60 % of the frame at 768 px, five tries a second.
+        private const val QR_SCAN_SIZE = 768
+        private const val QR_SCAN_CROP = 0.6f
+        private const val QR_SCAN_INTERVAL_MS = 200L
         private const val FRAME_TIMESTAMP_HEADER =
             "encoded_frame_index,sensor_timestamp_ns,exposure_time_ns," +
                 "capture_frame_number,surface_timestamp_ns,is_duplicate"
