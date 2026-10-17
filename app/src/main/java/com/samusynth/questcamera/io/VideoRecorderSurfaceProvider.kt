@@ -4,7 +4,6 @@ import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
@@ -22,6 +21,8 @@ import com.samusynth.questcamera.core.CameraSessionManager
 import com.samusynth.questcamera.core.ISurfaceProvider
 import java.io.BufferedWriter
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -42,6 +43,10 @@ import java.util.concurrent.atomic.AtomicReference
  * absolute 1/frameRate bin of the sensor clock (so both eyes encode the same
  * instants), never manufactures a duplicate, and writes an exact n/frameRate
  * presentation timeline into the MP4.
+ *
+ * Crash safety: the MP4 is fragmented ([FragmentedMp4Writer], one fsynced
+ * fragment per GOP) and the timestamp sidecar is flushed and fsynced with every
+ * fragment, so a killed process leaves both readable up to the last GOP.
  *
  * Bookkeeping never stops the encoder: every encoded frame gets a sidecar row
  * stamped with its SurfaceTexture (sensor) timestamp; exposure duration and the
@@ -113,6 +118,14 @@ class VideoRecorderSurfaceProvider(
         pipeline.updateOutputFiles(path, frameTimestampPath)
 
     fun startRecording() = pipeline.startRecording()
+
+    /** Pod setup's Scan QR: decode QR codes from this camera's frames while not recording. */
+    fun startQrScan() = pipeline.startQrScan()
+
+    fun stopQrScan() = pipeline.stopQrScan()
+
+    /** The first QR text decoded since [startQrScan], or "" (null does not cross JNI cleanly). */
+    fun getQrResult(): String = pipeline.qrResult() ?: ""
 
     fun requestStopRecording() = pipeline.requestStopRecording()
 
@@ -219,9 +232,7 @@ private class FixedFrameRateVideoPipeline(
 
     private var codec: MediaCodec? = null
     private var codecInputSurface: Surface? = null
-    private var muxer: MediaMuxer? = null
-    private var muxerStarted = false
-    private var muxerTrackIndex = -1
+    private var mp4: FragmentedMp4Writer? = null
     private val bufferInfo = MediaCodec.BufferInfo()
     private var submittedFrameCount = 0L
     private var writtenFrameCount = 0L
@@ -229,6 +240,7 @@ private class FixedFrameRateVideoPipeline(
     private val submittedFrameTimestamps = ArrayDeque<Long>()
     private val pendingFrameTimestampRows = ArrayDeque<PendingFrameTimestampRow>()
     private var frameTimestampWriter: BufferedWriter? = null
+    private var frameTimestampStream: FileOutputStream? = null
     private var captureFailure: Throwable? = null
 
     @Volatile
@@ -537,6 +549,7 @@ private class FixedFrameRateVideoPipeline(
                         renderEncoderFrame(surfaceTimestampNs)
                     }
                     if (isRecording) drainEncoder(endOfStream = false)
+                    else if (qrScanActive) grabQrFrame()
                 } catch (failure: Throwable) {
                     // Only encoder/EGL failures reach here; sidecar bookkeeping is
                     // counted, never thrown.
@@ -587,9 +600,17 @@ private class FixedFrameRateVideoPipeline(
             codec = newCodec
             codecInputSurface = newInputSurface
             encoderEglSurface = newEglSurface
-            muxer = MediaMuxer(recordingFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            muxerStarted = false
-            muxerTrackIndex = -1
+            // MediaMuxer truncated the session file here; keep that. The writer fills it
+            // from the encoder's first output format on.
+            recordingFile.outputStream().close()
+            mp4 = FragmentedMp4Writer(
+                file = recordingFile,
+                width = outputWidth,
+                height = outputHeight,
+                frameRate = frameRate,
+                gopFrames = gopFrameCount,
+                onFragmentDurable = { syncFrameTimestampRows() },
+            )
             newCodec.start()
         } catch (failure: Throwable) {
             runCatching { newCodec.release() }
@@ -651,11 +672,13 @@ private class FixedFrameRateVideoPipeline(
                     if (!endOfStream || SystemClock.uptimeMillis() >= deadlineMs) return
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    check(!muxerStarted) { "Encoder output format changed twice" }
-                    val activeMuxer = muxer ?: error("Muxer is unavailable")
-                    muxerTrackIndex = activeMuxer.addTrack(activeCodec.outputFormat)
-                    activeMuxer.start()
-                    muxerStarted = true
+                    val writer = mp4 ?: error("MP4 writer is unavailable")
+                    check(!writer.isStarted) { "Encoder output format changed twice" }
+                    val format = activeCodec.outputFormat
+                    writer.start(
+                        sps = format.csdBytes("csd-0"),
+                        pps = format.csdBytes("csd-1"),
+                    )
                 }
                 outputIndex >= 0 -> {
                     val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
@@ -666,7 +689,8 @@ private class FixedFrameRateVideoPipeline(
                     }
 
                     if (bufferInfo.size > 0) {
-                        check(muxerStarted) { "Encoded sample arrived before muxer format" }
+                        val writer = mp4 ?: error("MP4 writer is unavailable")
+                        check(writer.isStarted) { "Encoded sample arrived before the encoder format" }
                         val isSyncFrame =
                             bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
                         val expectedSyncFrame = writtenFrameCount % gopFrameCount == 0L
@@ -683,11 +707,9 @@ private class FixedFrameRateVideoPipeline(
                         outputBuffer.position(bufferInfo.offset)
                         outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-                        // Normalize at the mux boundary as a final guarantee that MP4
-                        // packet PTS values are exactly n/frameRate, independent of any
-                        // timestamp quantization performed by the hardware encoder.
-                        bufferInfo.presentationTimeUs = writtenFrameCount * 1_000_000L / frameRate
-                        muxer?.writeSampleData(muxerTrackIndex, outputBuffer, bufferInfo)
+                        // The writer stamps sample n at exactly n/frameRate, independent of
+                        // any timestamp quantization performed by the hardware encoder.
+                        writer.writeSample(outputBuffer, isSyncFrame)
                         val surfaceTimestampNs = submittedFrameTimestamps.pollFirst()
                             ?: error("Encoded sample has no source exposure timestamp")
                         pendingFrameTimestampRows.addLast(
@@ -720,21 +742,117 @@ private class FixedFrameRateVideoPipeline(
         }
         codec = null
 
-        muxer?.let { activeMuxer ->
-            if (muxerStarted) runCatching { activeMuxer.stop() }
-                .onFailure { Log.e(TAG, "Unable to finalize MP4 muxer", it) }
-            runCatching { activeMuxer.release() }
+        mp4?.let { writer ->
+            runCatching { writer.finish() }
+                .onFailure { Log.e(TAG, "Unable to finalize fragmented MP4", it) }
+            writer.close()
         }
-        muxer = null
-        muxerStarted = false
-        muxerTrackIndex = -1
+        mp4 = null
         submittedFrameTimestamps.clear()
         pendingFrameTimestampRows.clear()
+    }
+
+    // ── QR scan (pod setup): only while not recording, at most every QR_SCAN_INTERVAL_MS ──
+
+    @Volatile
+    private var qrScanActive = false
+    @Volatile
+    private var qrResult: String? = null
+    @Volatile
+    private var qrDecoding = false
+    private var lastQrGrabMs = 0L
+    private var qrFramebuffer = 0
+    private var qrTexture = 0
+    private val qrDecoder = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private lateinit var qrTexCoordBuffer: FloatBuffer
+
+    fun startQrScan() {
+        qrResult = null
+        qrScanActive = true
+    }
+
+    fun stopQrScan() {
+        qrScanActive = false
+    }
+
+    /** The first QR text decoded since [startQrScan], or null. */
+    fun qrResult(): String? = qrResult
+
+    /**
+     * Renders the centre of the camera frame (where a phone held up shows its code) at
+     * QR_SCAN_SIZE into an offscreen texture, reads it back and decodes it off this thread.
+     * Never runs while recording, so the recorder's cadence is untouched.
+     */
+    private fun grabQrFrame() {
+        val now = SystemClock.uptimeMillis()
+        if (qrDecoding || qrResult != null || now - lastQrGrabMs < QR_SCAN_INTERVAL_MS) return
+        lastQrGrabMs = now
+        if (qrFramebuffer == 0) {
+            val ids = IntArray(1)
+            GLES20.glGenTextures(1, ids, 0)
+            qrTexture = ids[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, qrTexture)
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, QR_SCAN_SIZE, QR_SCAN_SIZE, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glGenFramebuffers(1, ids, 0)
+            qrFramebuffer = ids[0]
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, qrFramebuffer)
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, qrTexture, 0)
+            check(GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                "QR framebuffer incomplete"
+            }
+            val lo = 0.5f - QR_SCAN_CROP / 2f
+            val hi = 0.5f + QR_SCAN_CROP / 2f
+            qrTexCoordBuffer = floatBufferOf(lo, lo, hi, lo, lo, hi, hi, hi)
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, qrFramebuffer)
+        GLES20.glViewport(0, 0, QR_SCAN_SIZE, QR_SCAN_SIZE)
+        GLES20.glUseProgram(shaderProgram)
+        vertexBuffer.position(0)
+        qrTexCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(positionLocation)
+        GLES20.glVertexAttribPointer(positionLocation, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+        GLES20.glEnableVertexAttribArray(texCoordLocation)
+        GLES20.glVertexAttribPointer(texCoordLocation, 2, GLES20.GL_FLOAT, false, 0, qrTexCoordBuffer)
+        GLES20.glUniformMatrix4fv(texMatrixLocation, 1, false, textureTransform, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        val pixels = ByteBuffer.allocateDirect(QR_SCAN_SIZE * QR_SCAN_SIZE * 4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(0, 0, QR_SCAN_SIZE, QR_SCAN_SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        val rgba = ByteArray(pixels.capacity())
+        pixels.position(0)
+        pixels.get(rgba)
+        qrDecoding = true
+        qrDecoder.execute {
+            try {
+                QrDecoder.decode(rgba, QR_SCAN_SIZE, QR_SCAN_SIZE)?.let { text ->
+                    if (qrScanActive && qrResult == null) {
+                        qrResult = text
+                        Log.i(TAG, "QR code decoded (${text.length} chars)")
+                    }
+                }
+            } catch (failure: Throwable) {
+                Log.w(TAG, "QR decode failed", failure)
+            } finally {
+                qrDecoding = false
+            }
+        }
     }
 
     private fun releaseGl() {
         if (eglDisplay == EGL14.EGL_NO_DISPLAY) return
         makeCurrent(pbufferSurface)
+        qrScanActive = false
+        qrDecoder.shutdownNow()
+        if (qrFramebuffer != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(qrFramebuffer), 0)
+        if (qrTexture != 0) GLES20.glDeleteTextures(1, intArrayOf(qrTexture), 0)
+        qrFramebuffer = 0
+        qrTexture = 0
 
         surfaceTexture?.setOnFrameAvailableListener(null)
         cameraInputSurface.release()
@@ -841,9 +959,32 @@ private class FixedFrameRateVideoPipeline(
     private fun openFrameTimestampWriter(file: File) {
         closeFrameTimestampWriter()
         file.parentFile?.mkdirs()
-        frameTimestampWriter = file.bufferedWriter().also { writer ->
+        val stream = FileOutputStream(file)
+        frameTimestampStream = stream
+        frameTimestampWriter = BufferedWriter(OutputStreamWriter(stream, Charsets.UTF_8)).also { writer ->
             writer.write(FRAME_TIMESTAMP_HEADER)
             writer.newLine()
+        }
+        // The header is durable before the first frame, so a killed session never
+        // leaves a 0-byte sidecar.
+        syncFrameTimestampRows()
+    }
+
+    /**
+     * Writes every row whose capture result has arrived, then flushes and fsyncs the
+     * sidecar. Runs after each MP4 fragment is durable (once per GOP), so after a kill the
+     * sidecar covers at least the frames the MP4 still holds, minus rows still waiting
+     * on their capture result.
+     */
+    private fun syncFrameTimestampRows() {
+        flushFrameTimestampRows(force = false)
+        val writer = frameTimestampWriter ?: return
+        try {
+            writer.flush()
+            frameTimestampStream?.fd?.sync()
+        } catch (failure: java.io.IOException) {
+            captureFailure = captureFailure ?: failure
+            Log.e(TAG, "Unable to sync frame timestamp sidecar", failure)
         }
     }
 
@@ -912,10 +1053,12 @@ private class FixedFrameRateVideoPipeline(
         frameTimestampWriter?.let { writer ->
             runCatching {
                 writer.flush()
+                frameTimestampStream?.fd?.sync()
                 writer.close()
             }.onFailure { Log.e(TAG, "Unable to finalize frame timestamp sidecar", it) }
         }
         frameTimestampWriter = null
+        frameTimestampStream = null
     }
 
     private fun runOnWorkerBlocking(operation: String, block: () -> Unit) {
@@ -956,6 +1099,10 @@ private class FixedFrameRateVideoPipeline(
         private const val MIN_SOURCE_RATE_WINDOW_FRAMES = 10
         private const val PASS_THROUGH_SOURCE_MAX_HZ = 35.0
         private const val NANOS_PER_SECOND = 1_000_000_000L
+        // QR scan: the centre 60 % of the frame at 768 px, five tries a second.
+        private const val QR_SCAN_SIZE = 768
+        private const val QR_SCAN_CROP = 0.6f
+        private const val QR_SCAN_INTERVAL_MS = 200L
         private const val FRAME_TIMESTAMP_HEADER =
             "encoded_frame_index,sensor_timestamp_ns,exposure_time_ns," +
                 "capture_frame_number,surface_timestamp_ns,is_duplicate"
@@ -981,6 +1128,14 @@ private class FixedFrameRateVideoPipeline(
             }
         """
     }
+}
+
+/** A codec-specific-data buffer (`csd-0`/`csd-1`) as bytes, start code included. */
+private fun MediaFormat.csdBytes(key: String): ByteArray {
+    val buffer = getByteBuffer(key) ?: error("Encoder output format has no $key")
+    val bytes = ByteArray(buffer.remaining())
+    buffer.duplicate().get(bytes)
+    return bytes
 }
 
 private data class CameraFrameTimestamp(
