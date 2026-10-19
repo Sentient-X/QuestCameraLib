@@ -1,6 +1,10 @@
 package com.samusynth.questcamera.io
 
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -13,6 +17,7 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLES30
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -118,6 +123,8 @@ class VideoRecorderSurfaceProvider(
 
     fun stopRecording() = pipeline.stopRecording()
 
+    fun getPreviewPacket(): ByteArray? = pipeline.getPreviewPacket()
+
     fun getSourceFrameCount(): Long = pipeline.sourceFrameCount()
 
     fun getSourceDroppedFrameCount(): Long = pipeline.sourceDroppedFrameCount()
@@ -181,6 +188,21 @@ private class FixedFrameRateVideoPipeline(
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var eglConfig: EGLConfig? = null
+    private val previewRequested = AtomicBoolean(false)
+    private val previewBusy = AtomicBoolean(false)
+    private val previewEncoder = Executors.newSingleThreadExecutor()
+    private val previewPacket = AtomicReference<ByteArray?>(null)
+    private var lastPreviewNs = 0L
+    private var previewBuffer = 0
+    private var previewFence = 0L
+    private var previewStamp = 0L
+    private val previewSize = 512
+
+    fun getPreviewPacket(): ByteArray? {
+        previewRequested.set(true)
+        return previewPacket.get()
+    }
+
     private var pbufferSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var encoderEglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
 
@@ -448,9 +470,15 @@ private class FixedFrameRateVideoPipeline(
             isClosed = true
             worker.removeCallbacksAndMessages(null)
             releaseEncoderAndMuxer()
+            if (previewFence != 0L) GLES30.glDeleteSync(previewFence)
+            if (previewBuffer != 0) GLES30.glDeleteBuffers(1, intArrayOf(previewBuffer), 0)
+            previewFence = 0L
+            previewBuffer = 0
             releaseGl()
         }
 
+        previewEncoder.shutdownNow()
+        previewPacket.set(null)
         workerThread.quitSafely()
         if (Thread.currentThread() !== workerThread) {
             workerThread.join()
@@ -467,7 +495,7 @@ private class FixedFrameRateVideoPipeline(
             EGL14.EGL_GREEN_SIZE, 8,
             EGL14.EGL_BLUE_SIZE, 8,
             EGL14.EGL_ALPHA_SIZE, 8,
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, 0x0040 /* EGL_OPENGL_ES3_BIT_KHR */,
             EGL_RECORDABLE_ANDROID, 1,
             EGL14.EGL_NONE,
         )
@@ -483,7 +511,7 @@ private class FixedFrameRateVideoPipeline(
             eglDisplay,
             eglConfig,
             EGL14.EGL_NO_CONTEXT,
-            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE),
             0,
         )
         check(eglContext != EGL14.EGL_NO_CONTEXT) { "Unable to create EGL context" }
@@ -491,7 +519,7 @@ private class FixedFrameRateVideoPipeline(
         pbufferSurface = EGL14.eglCreatePbufferSurface(
             eglDisplay,
             eglConfig,
-            intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE),
+            intArrayOf(EGL14.EGL_WIDTH, previewSize, EGL14.EGL_HEIGHT, previewSize, EGL14.EGL_NONE),
             0,
         )
         check(pbufferSurface != EGL14.EGL_NO_SURFACE) { "Unable to create EGL pbuffer" }
@@ -546,6 +574,9 @@ private class FixedFrameRateVideoPipeline(
                         Log.e(TAG, "Unable to encode camera exposure", failure)
                     }
                 }
+                // Optional preview errors must never enter the encoder failure path.
+                try { previewFrame(availableTexture.timestamp) }
+                catch (failure: Exception) { Log.w(TAG, "Preview unavailable", failure) }
                 flushFrameTimestampRows(force = false)
             }, worker)
         }
@@ -610,7 +641,20 @@ private class FixedFrameRateVideoPipeline(
         // The whole source texture onto the whole encoder surface: an isotropic
         // resample, since the constructor requires equal aspects.
         makeCurrent(encoderEglSurface)
-        GLES20.glViewport(0, 0, outputWidth, outputHeight)
+        drawTexture(outputWidth, outputHeight)
+
+        val presentationNs = submittedFrameCount * 1_000_000_000L / frameRate
+        check(EGLExt.eglPresentationTimeANDROID(eglDisplay, encoderEglSurface, presentationNs)) {
+            "eglPresentationTimeANDROID failed"
+        }
+        check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
+        submittedFrameTimestamps.addLast(surfaceTimestampNs)
+        submittedFrameCount++
+        makeCurrent(pbufferSurface)
+    }
+
+    private fun drawTexture(width: Int, height: Int) {
+        GLES20.glViewport(0, 0, width, height)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(shaderProgram)
@@ -626,14 +670,79 @@ private class FixedFrameRateVideoPipeline(
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-        val presentationNs = submittedFrameCount * 1_000_000_000L / frameRate
-        check(EGLExt.eglPresentationTimeANDROID(eglDisplay, encoderEglSurface, presentationNs)) {
-            "eglPresentationTimeANDROID failed"
+    }
+
+    private fun previewFrame(stamp: Long) {
+        // A zero-timeout fence poll: never wait for GPU readback on the encoder worker.
+        if (previewFence != 0L) {
+            val ready = GLES30.glClientWaitSync(previewFence, 0, 0)
+            if (ready == GLES30.GL_TIMEOUT_EXPIRED) return
+            GLES30.glDeleteSync(previewFence)
+            previewFence = 0L
+            if (ready == GLES30.GL_WAIT_FAILED) { previewBusy.set(false); return }
+            try {
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, previewBuffer)
+                val mapped = GLES30.glMapBufferRange(GLES30.GL_PIXEL_PACK_BUFFER, 0,
+                    previewSize * previewSize * 4, GLES30.GL_MAP_READ_BIT) as? ByteBuffer
+                    ?: error("preview buffer not ready")
+                val rgba = ByteArray(previewSize * previewSize * 4)
+                mapped.get(rgba)
+                check(GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER))
+                val captured = previewStamp
+                previewEncoder.execute { encodePreview(rgba, captured) }
+            } catch (failure: Exception) {
+                previewBusy.set(false)
+                throw failure
+            } finally { GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0) }
         }
-        check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
-        submittedFrameTimestamps.addLast(surfaceTimestampNs)
-        submittedFrameCount++
-        makeCurrent(pbufferSurface)
+        if (!previewRequested.get() || stamp - lastPreviewNs < 500_000_000L ||
+            !previewBusy.compareAndSet(false, true)) return
+        previewRequested.set(false)
+        lastPreviewNs = stamp
+        try {
+            makeCurrent(pbufferSurface)
+            drawTexture(previewSize, previewSize)
+            if (previewBuffer == 0) {
+                val names = IntArray(1)
+                GLES30.glGenBuffers(1, names, 0)
+                previewBuffer = names[0]
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, previewBuffer)
+                GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER, previewSize * previewSize * 4,
+                    null, GLES30.GL_STREAM_READ)
+            } else GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, previewBuffer)
+            // Offset into the PBO, not a CPU buffer. The GPU fills it asynchronously.
+            GLES30.glReadPixels(0, 0, previewSize, previewSize, GLES30.GL_RGBA,
+                GLES30.GL_UNSIGNED_BYTE, 0)
+            previewStamp = stamp
+            previewFence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+            check(previewFence != 0L && GLES30.glGetError() == GLES30.GL_NO_ERROR)
+            GLES30.glFlush()
+        } catch (failure: Exception) {
+            if (previewFence != 0L) GLES30.glDeleteSync(previewFence)
+            previewFence = 0L
+            previewBusy.set(false)
+            throw failure
+        } finally { GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0) }
+    }
+
+    private fun encodePreview(rgba: ByteArray, stamp: Long) {
+        try {
+            val flipped = ByteBuffer.allocate(rgba.size)
+            val stride = previewSize * 4
+            for (y in previewSize - 1 downTo 0) flipped.put(rgba, y * stride, stride)
+            flipped.rewind()
+            val bitmap = Bitmap.createBitmap(previewSize, previewSize, Bitmap.Config.ARGB_8888)
+            try {
+                bitmap.copyPixelsFromBuffer(flipped)
+                val encoded = ByteArrayOutputStream()
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 80, encoded))
+                val jpeg = encoded.toByteArray()
+                previewPacket.set(ByteBuffer.allocate(8 + jpeg.size).order(ByteOrder.BIG_ENDIAN)
+                    .putLong(stamp).put(jpeg).array())
+            } finally { bitmap.recycle() }
+        } catch (failure: Exception) {
+            Log.w(TAG, "Preview JPEG unavailable", failure)
+        } finally { previewBusy.set(false) }
     }
 
     private fun drainEncoder(endOfStream: Boolean) {
