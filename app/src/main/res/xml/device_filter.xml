@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The rig's USB devices. Referenced by the app manifest's USB_DEVICE_ATTACHED filter, so
+     once "always open with" is chosen the app is the default handler and is never re-prompted.
+     Keep in step with RigUsbBridge.isRigDevice. -->
+<resources>
+    <!-- UVC wrist camera 32e4:9230 -->
+    <usb-device vendor-id="13028" product-id="37424" />
+    <!-- Espressif 303a:* (ESP32-C6 gripper encoders) -->
+    <usb-device vendor-id="12346" />
+</resources>

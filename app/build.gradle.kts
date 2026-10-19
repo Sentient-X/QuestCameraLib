@@ -39,6 +39,9 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation(libs.ktx.serialization.json)
+    // QR decoding for the pod setup panel (Apache-2.0). The Unity app's mainTemplate.gradle
+    // declares the same artifact, since an AAR does not carry its dependencies.
+    implementation("com.google.zxing:core:3.5.3")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
