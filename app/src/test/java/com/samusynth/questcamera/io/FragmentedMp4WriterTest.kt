@@ -136,6 +136,60 @@ class FragmentedMp4WriterTest {
         ffprobeFrames(file)?.let { (frames, _) -> assertTrue("decoded $frames", frames in 60 until 90) }
     }
 
+    @Test
+    fun aSlowFsyncNeverBlocksTheCallerAndFragmentsStayInOrder() {
+        val stream = loadFixture()
+        val file = tmp.newFile("slow.mp4")
+        val events = java.util.Collections.synchronizedList(ArrayList<String>())
+        val callerThread = Thread.currentThread()
+        var durableOnCaller = false
+        val writer = FragmentedMp4Writer(
+            file, 128, 128, 30,
+            onFragmentQueued = { events.add("queued") },
+            onFragmentDurable = {
+                if (Thread.currentThread() === callerThread) durableOnCaller = true
+                Thread.sleep(300)
+                events.add("durable")
+            },
+        )
+        writer.start(stream.sps, stream.pps)
+        val startNs = System.nanoTime()
+        // Frame 60 queues the second fragment while the first one's 300 ms "fsync" still runs.
+        stream.frames.take(90).forEach { (data, sync) -> writer.writeSample(ByteBuffer.wrap(data), sync) }
+        val feedMs = (System.nanoTime() - startNs) / 1_000_000
+        assertTrue("feeding 90 frames took $feedMs ms behind a 300 ms fsync", feedMs < 250)
+        writer.finish()
+        assertTrue("onFragmentDurable ran on the caller's thread", !durableOnCaller)
+        assertEquals(listOf("queued", "queued", "queued"), events.filter { it == "queued" })
+        assertEquals(6, events.size)
+        assertEquals("queued", events.first())
+        assertTrue(writer.maxQueuedFragments >= 2)
+        assertTrue(writer.maxFragmentDurableNs >= 300_000_000L)
+        assertEquals(listOf("ftyp", "moov", "moof", "mdat", "moof", "mdat", "moof", "mdat"), topLevelBoxes(file))
+        ffprobeFrames(file)?.let { (frames, duration) ->
+            assertEquals(90, frames)
+            assertEquals(3.0, duration, 0.001)
+        }
+    }
+
+    @Test
+    fun aFailedFragmentWriteSurfacesOnTheNextSample() {
+        val stream = loadFixture()
+        val file = tmp.newFile("failed.mp4")
+        val writer = FragmentedMp4Writer(
+            file, 128, 128, 30,
+            onFragmentDurable = { throw java.io.IOException("disk gone") },
+        )
+        writer.start(stream.sps, stream.pps)
+        stream.frames.take(31).forEach { (data, sync) -> writer.writeSample(ByteBuffer.wrap(data), sync) }
+        writer.awaitDurable()
+        val thrown = runCatching {
+            writer.writeSample(ByteBuffer.wrap(stream.frames[31].first), stream.frames[31].second)
+        }.exceptionOrNull()
+        assertTrue("expected an IOException, got $thrown", thrown is java.io.IOException)
+        assertTrue(runCatching { writer.finish() }.exceptionOrNull() is java.io.IOException)
+    }
+
     /** (decoded frame count, format duration) via ffprobe, or null when ffprobe is absent. */
     private fun ffprobeFrames(file: File): Pair<Int, Double>? {
         val probe = runCatching {

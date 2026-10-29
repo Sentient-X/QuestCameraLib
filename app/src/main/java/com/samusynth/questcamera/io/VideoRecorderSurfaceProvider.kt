@@ -46,7 +46,9 @@ import java.util.concurrent.atomic.AtomicReference
  *
  * Crash safety: the MP4 is fragmented ([FragmentedMp4Writer], one fsynced
  * fragment per GOP) and the timestamp sidecar is flushed and fsynced with every
- * fragment, so a killed process leaves both readable up to the last GOP.
+ * fragment, so a killed process leaves both readable up to the last GOP. Both
+ * fsyncs run on the writer's I/O thread, never on this worker: the worker is
+ * the SurfaceTexture's consumer, and blocking it loses camera exposures.
  *
  * Bookkeeping never stops the encoder: every encoded frame gets a sidecar row
  * stamped with its SurfaceTexture (sensor) timestamp; exposure duration and the
@@ -240,8 +242,15 @@ private class FixedFrameRateVideoPipeline(
     private val submittedFrameTimestamps = ArrayDeque<Long>()
     private val pendingFrameTimestampRows = ArrayDeque<PendingFrameTimestampRow>()
     private var frameTimestampWriter: BufferedWriter? = null
+    // Read by the MP4 writer's I/O thread, which fsyncs the sidecar after each fragment.
+    @Volatile
     private var frameTimestampStream: FileOutputStream? = null
+    @Volatile
     private var captureFailure: Throwable? = null
+    // Durability evidence, logged at stop (the headset log, not the metadata sidecar's shape):
+    // the I/O thread's worst backlog and slowest fragment write + fsyncs.
+    private var ioMaxQueuedFragments = 0
+    private var ioMaxFragmentDurableNs = 0L
 
     @Volatile
     private var isRecording = false
@@ -340,6 +349,8 @@ private class FixedFrameRateVideoPipeline(
             timestampRegressionCount = 0L
             selectedMeanRateHz = 0.0
             selectedMaxGapNs = 0L
+            ioMaxQueuedFragments = 0
+            ioMaxFragmentDurableNs = 0L
             synchronized(captureStatsLock) {
                 sourceFrameCount = 0L
                 sourceDroppedFrameCount = 0L
@@ -445,7 +456,12 @@ private class FixedFrameRateVideoPipeline(
                 closeFrameTimestampWriter()
                 releaseEncoderAndMuxer()
             }
-            Log.i(TAG, "Stopped fixed-rate recording after $writtenFrameCount frames")
+            Log.i(
+                TAG,
+                "Stopped fixed-rate recording after $writtenFrameCount frames " +
+                    "(fragment I/O: max queued $ioMaxQueuedFragments, slowest durable " +
+                    "${"%.1f".format(java.util.Locale.ROOT, ioMaxFragmentDurableNs / 1e6)} ms)",
+            )
         }
     }
 
@@ -609,7 +625,10 @@ private class FixedFrameRateVideoPipeline(
                 height = outputHeight,
                 frameRate = frameRate,
                 gopFrames = gopFrameCount,
-                onFragmentDurable = { syncFrameTimestampRows() },
+                // Worker thread: rows reach the OS before the fragment is queued.
+                onFragmentQueued = { writeFrameTimestampRowsToOs() },
+                // I/O thread, after the fragment's fsync: the sidecar's fsync covers those rows.
+                onFragmentDurable = { syncFrameTimestampSidecar() },
             )
             newCodec.start()
         } catch (failure: Throwable) {
@@ -746,6 +765,8 @@ private class FixedFrameRateVideoPipeline(
             runCatching { writer.finish() }
                 .onFailure { Log.e(TAG, "Unable to finalize fragmented MP4", it) }
             writer.close()
+            ioMaxQueuedFragments = maxOf(ioMaxQueuedFragments, writer.maxQueuedFragments)
+            ioMaxFragmentDurableNs = maxOf(ioMaxFragmentDurableNs, writer.maxFragmentDurableNs)
         }
         mp4 = null
         submittedFrameTimestamps.clear()
@@ -971,11 +992,34 @@ private class FixedFrameRateVideoPipeline(
     }
 
     /**
-     * Writes every row whose capture result has arrived, then flushes and fsyncs the
-     * sidecar. Runs after each MP4 fragment is durable (once per GOP), so after a kill the
-     * sidecar covers at least the frames the MP4 still holds, minus rows still waiting
-     * on their capture result.
+     * Worker thread, as each MP4 fragment is queued (once per GOP): writes every row whose
+     * capture result has arrived and flushes them to the OS. The I/O thread then fsyncs the
+     * fragment and, in [syncFrameTimestampSidecar], the sidecar, so after a kill the sidecar
+     * covers at least the frames the MP4 still holds, minus rows still waiting on their
+     * capture result.
      */
+    private fun writeFrameTimestampRowsToOs() {
+        flushFrameTimestampRows(force = false)
+        try {
+            frameTimestampWriter?.flush()
+        } catch (failure: java.io.IOException) {
+            captureFailure = captureFailure ?: failure
+            Log.e(TAG, "Unable to write frame timestamp sidecar", failure)
+        }
+    }
+
+    /** I/O thread, after a fragment's fsync. [closeFrameTimestampWriter] waits for it first. */
+    private fun syncFrameTimestampSidecar() {
+        val stream = frameTimestampStream ?: return
+        try {
+            stream.fd.sync()
+        } catch (failure: java.io.IOException) {
+            captureFailure = captureFailure ?: failure
+            Log.e(TAG, "Unable to sync frame timestamp sidecar", failure)
+        }
+    }
+
+    /** Writes, flushes and fsyncs the sidecar on this thread; only for the header at open. */
     private fun syncFrameTimestampRows() {
         flushFrameTimestampRows(force = false)
         val writer = frameTimestampWriter ?: return
@@ -1050,6 +1094,9 @@ private class FixedFrameRateVideoPipeline(
     }
 
     private fun closeFrameTimestampWriter() {
+        // No sidecar fsync may still be queued on the MP4 writer's I/O thread once it closes.
+        runCatching { mp4?.awaitDurable() }
+            .onFailure { Log.e(TAG, "Unable to wait for queued MP4 fragments", it) }
         frameTimestampWriter?.let { writer ->
             runCatching {
                 writer.flush()
