@@ -3,14 +3,26 @@ package com.samusynth.questcamera.io
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A crash-safe H.264 MP4 writer: an empty-sample `moov` up front, then one `moof`+`mdat`
  * fragment per GOP, each written in one call and fsynced. A process killed mid-episode
  * leaves a playable file up to the last complete fragment (≈ one GOP), where
  * `MediaMuxer`'s plain MP4 leaves no `moov` and nothing playable.
+ *
+ * Fragments are written and fsynced on this writer's own I/O thread, never on the caller's:
+ * the caller is the camera/EGL thread that consumes Camera2 frames, and an fsync there (tens
+ * to hundreds of ms on a busy headset) let the SurfaceTexture queue overflow, losing 50 Hz
+ * exposures for that eye — the 60–280 ms `head_video interior gap`s the seal refused. Fragments
+ * reach the file in order; an I/O failure surfaces on the next [writeSample] or [finish];
+ * [finish] and [close] wait for every queued fragment.
  *
  * On a clean [finish] the movie, track, media and fragment durations are patched into the
  * up-front boxes, so tools that read only the `moov` see the true duration as well.
@@ -29,7 +41,12 @@ class FragmentedMp4Writer(
     frameRate: Int,
     /** A fragment is cut at the first sync sample after this many samples, or at twice it. */
     private val gopFrames: Int = frameRate,
-    /** Called after each fragment is durable; the pipeline fsyncs its timestamp sidecar here. */
+    /**
+     * Called on the caller's thread just before a fragment is queued: the pipeline writes its
+     * timestamp sidecar rows to the OS here, so the fsync after the fragment covers them.
+     */
+    private val onFragmentQueued: () -> Unit = {},
+    /** Called on the I/O thread after each fragment is durable; the pipeline fsyncs its sidecar here. */
     private val onFragmentDurable: () -> Unit = {},
 ) : AutoCloseable {
     init {
@@ -47,6 +64,18 @@ class FragmentedMp4Writer(
     private val pendingSync = ArrayList<Boolean>()
     private val pendingData = ByteArrayOutputStream()
     private var pendingBaseSample = 0L
+    // Where the next fragment lands; fragments are laid out on the caller's thread, written on io.
+    private var fileEnd = 0L
+    private val io: ExecutorService = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "Mp4Durability-${file.name}").apply { isDaemon = true }
+    }
+    @Volatile
+    private var ioFailure: Throwable? = null
+    private val queuedFragments = AtomicInteger(0)
+    @Volatile
+    private var maxQueued = 0
+    @Volatile
+    private var maxDurableNs = 0L
 
     // Absolute file offsets of the duration fields patched at finish().
     private var mvhdDurationOffset = -1L
@@ -56,8 +85,14 @@ class FragmentedMp4Writer(
 
     val isStarted: Boolean get() = started
 
-    /** Fully written (durable) samples. */
+    /** Samples handed to durable storage (written, or queued on the I/O thread). */
     val durableSampleCount: Long get() = samplesWritten
+
+    /** Most fragments ever waiting on the I/O thread at once (1 = never more than the one in flight). */
+    val maxQueuedFragments: Int get() = maxQueued
+
+    /** Longest write + fsync of one fragment, sidecar fsync included, in ns. */
+    val maxFragmentDurableNs: Long get() = maxDurableNs
 
     /**
      * Writes `ftyp` + `moov` from the codec's parameter sets (`csd-0` = SPS, `csd-1` = PPS,
@@ -92,12 +127,14 @@ class FragmentedMp4Writer(
 
         out.write(header.toByteArray())
         out.fd.sync()
+        fileEnd = out.length()
         started = true
     }
 
     /** Appends one encoded access unit (Annex-B). Cuts and syncs a fragment at GOP boundaries. */
     fun writeSample(data: ByteBuffer, isSync: Boolean) {
         check(started) { "FragmentedMp4Writer not started" }
+        throwIfIoFailed()
         val pendingCount = pendingSizes.size
         if (pendingCount > 0 && ((isSync && pendingCount >= gopFrames) || pendingCount >= 2 * gopFrames)) {
             flushFragment()
@@ -108,12 +145,20 @@ class FragmentedMp4Writer(
         pendingData.write(avcc)
     }
 
+    /** Blocks until every queued fragment is written and fsynced (or the I/O thread failed). */
+    fun awaitDurable() {
+        if (io.isShutdown) return
+        io.submit {}.get()
+    }
+
     /** Writes the last fragment, patches durations into the `moov`, fsyncs and closes. */
     fun finish() {
-        val out = raf ?: return
+        val out = raf ?: run { stopIo(); return }
         try {
             if (started) {
                 flushFragment()
+                awaitDurable()
+                throwIfIoFailed()
                 val totalTicks = samplesWritten * sampleDuration
                 patchU32(out, mvhdDurationOffset, totalTicks)
                 patchU32(out, tkhdDurationOffset, totalTicks)
@@ -122,16 +167,29 @@ class FragmentedMp4Writer(
                 out.fd.sync()
             }
         } finally {
+            stopIo()
             out.close()
             raf = null
         }
     }
 
-    /** Closes without patching; complete fragments stay readable. */
+    /** Closes without patching; queued fragments are still written, so complete fragments stay readable. */
     override fun close() {
+        stopIo()
         val out = raf ?: return
         runCatching { out.close() }
         raf = null
+    }
+
+    private fun stopIo() {
+        io.shutdown()
+        if (!io.awaitTermination(IO_DRAIN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            io.shutdownNow()
+        }
+    }
+
+    private fun throwIfIoFailed() {
+        ioFailure?.let { throw IOException("Writing an MP4 fragment failed", it) }
     }
 
     private fun flushFragment() {
@@ -149,16 +207,36 @@ class FragmentedMp4Writer(
         System.arraycopy(moof, 0, fragment, 0, moof.size)
         System.arraycopy(mdatHeader, 0, fragment, moof.size, mdatHeader.size)
         System.arraycopy(payload, 0, fragment, moof.size + mdatHeader.size, payload.size)
-        out.seek(out.length())
-        out.write(fragment)
-        out.fd.sync()
+        val offset = fileEnd
+        fileEnd += fragment.size
 
         samplesWritten += count
         pendingBaseSample = samplesWritten
         pendingSizes.clear()
         pendingSync.clear()
         pendingData.reset()
-        onFragmentDurable()
+        onFragmentQueued()
+
+        val depth = queuedFragments.incrementAndGet()
+        if (depth > maxQueued) maxQueued = depth
+        io.execute {
+            try {
+                // After a failure later fragments would leave a hole; the next writeSample throws.
+                if (ioFailure != null) return@execute
+                val startNs = System.nanoTime()
+                val buffer = ByteBuffer.wrap(fragment)
+                var position = offset
+                while (buffer.hasRemaining()) position += out.channel.write(buffer, position)
+                out.fd.sync()
+                onFragmentDurable()
+                val elapsedNs = System.nanoTime() - startNs
+                if (elapsedNs > maxDurableNs) maxDurableNs = elapsedNs
+            } catch (failure: Throwable) {
+                if (ioFailure == null) ioFailure = failure
+            } finally {
+                queuedFragments.decrementAndGet()
+            }
+        }
     }
 
     private fun buildMoof(count: Int): ByteArray {
@@ -294,6 +372,7 @@ class FragmentedMp4Writer(
     }
 
     companion object {
+        private const val IO_DRAIN_TIMEOUT_SECONDS = 30L
         private const val TRACK_ID = 1
         private const val TICKS_PER_FRAME = 1000
         private const val SYNC_SAMPLE_FLAGS = 0x02000000
