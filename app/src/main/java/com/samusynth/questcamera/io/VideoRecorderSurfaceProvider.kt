@@ -19,16 +19,15 @@ import android.util.Log
 import android.view.Surface
 import com.samusynth.questcamera.core.CameraSessionManager
 import com.samusynth.questcamera.core.ISurfaceProvider
-import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStreamWriter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -44,11 +43,21 @@ import java.util.concurrent.atomic.AtomicReference
  * instants), never manufactures a duplicate, and writes an exact n/frameRate
  * presentation timeline into the MP4.
  *
+ * Threads (per eye): the *camera thread* (this worker, the SurfaceTexture's
+ * consumer) only latches, selects and renders exposures into the encoder; it
+ * never touches storage or drains the encoder, because blocking it lets the
+ * SurfaceTexture queue overflow and loses camera exposures. The *encoder output
+ * thread* drains MediaCodec, lays out MP4 fragments and joins sidecar rows with
+ * their Camera2 results. The *durable I/O thread* ([DurableIoQueue], bounded and
+ * ordered) is the only one that writes or fsyncs files while recording; when it
+ * falls [FragmentedMp4Writer.DEFAULT_IO_QUEUE_CAPACITY] jobs behind, the eye
+ * ends with a capture error instead of stalling the camera.
+ *
  * Crash safety: the MP4 is fragmented ([FragmentedMp4Writer], one fsynced
- * fragment per GOP) and the timestamp sidecar is flushed and fsynced with every
- * fragment, so a killed process leaves both readable up to the last GOP. Both
- * fsyncs run on the writer's I/O thread, never on this worker: the worker is
- * the SurfaceTexture's consumer, and blocking it loses camera exposures.
+ * fragment per GOP). A sidecar row is queued only behind the fragment holding
+ * its frame and then fsynced, so a killed process leaves both readable up to the
+ * last durable GOP and the sidecar never names a frame the MP4 lacks (it may lag
+ * by rows still waiting on their capture result).
  *
  * Bookkeeping never stops the encoder: every encoded frame gets a sidecar row
  * stamped with its SurfaceTexture (sensor) timestamp; exposure duration and the
@@ -215,9 +224,12 @@ private class FixedFrameRateVideoPipeline(
     private var sourceSequenceErrorCount = 0L
     private var exposureMissingCount = 0L
     private val recentSourceTimestampsNs = ArrayDeque<Long>()
-    // Worker-thread counters (frame callback / stop only).
+    // Encoder-output-thread counters, read after stop.
+    @Volatile
     private var captureResultMissingCount = 0L
+    @Volatile
     private var gopViolationCount = 0L
+    // Camera-thread counter.
     private var timestampRegressionCount = 0L
     private var selectedMeanRateHz = 0.0
     private var selectedMaxGapNs = 0L
@@ -235,22 +247,34 @@ private class FixedFrameRateVideoPipeline(
     private var codec: MediaCodec? = null
     private var codecInputSurface: Surface? = null
     private var mp4: FragmentedMp4Writer? = null
+    // Encoder output thread only.
     private val bufferInfo = MediaCodec.BufferInfo()
     private var submittedFrameCount = 0L
+    @Volatile
     private var writtenFrameCount = 0L
     private val exposureSelector = ExposureFrameSelector(frameRate)
-    private val submittedFrameTimestamps = ArrayDeque<Long>()
+    // Camera thread appends after each encoder swap; the encoder output thread polls.
+    private val submittedFrameTimestamps = ConcurrentLinkedQueue<Long>()
     private val pendingFrameTimestampRows = ArrayDeque<PendingFrameTimestampRow>()
-    private var frameTimestampWriter: BufferedWriter? = null
-    // Read by the MP4 writer's I/O thread, which fsyncs the sidecar after each fragment.
+    // Opened on the camera thread at start; written, fsynced and closed on the I/O and
+    // encoder output threads (see runEncoderOutput).
     @Volatile
     private var frameTimestampStream: FileOutputStream? = null
     @Volatile
     private var captureFailure: Throwable? = null
-    // Durability evidence, logged at stop (the headset log, not the metadata sidecar's shape):
-    // the I/O thread's worst backlog and slowest fragment write + fsyncs.
+    private var encoderOutputThread: Thread? = null
+    @Volatile
+    private var endOfInputSignalled = false
+    @Volatile
+    private var encoderOutputFailure: Throwable? = null
+    // Durability evidence: the I/O queue's worst backlog and slowest fragment write + fsync.
+    @Volatile
     private var ioMaxQueuedFragments = 0
+    @Volatile
     private var ioMaxFragmentDurableNs = 0L
+    // Per-stage worst case of the last recording, in capture_report.stage_max_ns. Each is
+    // written by one thread and read after stop.
+    private val stageMax = StageMaxima()
 
     @Volatile
     private var isRecording = false
@@ -262,6 +286,8 @@ private class FixedFrameRateVideoPipeline(
     private var isClosed = false
 
     private val gopFrameCount = frameRate * iFrameIntervalSeconds
+    // Camera thread: when the previous frame callback of this recording began.
+    private var lastFrameCallbackNs = 0L
 
     init {
         runOnWorkerBlocking("initialize EGL camera surface") {
@@ -306,7 +332,6 @@ private class FixedFrameRateVideoPipeline(
         // result must not lose it because the source runs fast.
         val horizonNs = sensorTimestampNs - CAPTURE_RESULT_RETENTION_NS
         captureResults.keys.removeAll { it < horizonNs }
-        worker.post { flushFrameTimestampRows(force = false) }
     }
 
     fun updateOutputFiles(path: String, frameTimestampPath: String) = synchronized(stateLock) {
@@ -324,6 +349,9 @@ private class FixedFrameRateVideoPipeline(
         if (recordingSessionActive) return@synchronized
 
         val recordingFile = outputFile
+        encoderOutputThread?.let { previous ->
+            check(!previous.isAlive) { "The previous recording's encoder output is still finishing" }
+        }
         runOnWorkerBlocking("start fixed-rate recording") {
             if (codec == null) {
                 // Defensive fallback for callers that start without first selecting
@@ -351,6 +379,8 @@ private class FixedFrameRateVideoPipeline(
             selectedMaxGapNs = 0L
             ioMaxQueuedFragments = 0
             ioMaxFragmentDurableNs = 0L
+            stageMax.reset()
+            lastFrameCallbackNs = 0L
             synchronized(captureStatsLock) {
                 sourceFrameCount = 0L
                 sourceDroppedFrameCount = 0L
@@ -359,7 +389,15 @@ private class FixedFrameRateVideoPipeline(
                 exposureMissingCount = 0L
                 captureStatsActive = true
             }
-            openFrameTimestampWriter(frameTimestampFile)
+            val activeCodec = codec ?: error("Encoder is not prepared")
+            val writer = mp4 ?: error("MP4 writer is not prepared")
+            val sidecar = openFrameTimestampWriter(frameTimestampFile, writer)
+            endOfInputSignalled = false
+            encoderOutputFailure = null
+            encoderOutputThread = Thread(
+                { runEncoderOutput(activeCodec, writer, sidecar) },
+                "EncoderOutput-${outputWidth}x${outputHeight}",
+            ).apply { start() }
             recordingSessionActive = true
             isRecording = true
             val sourceRate = sourceRateHz?.let { "%.3f Hz".format(it) } ?: "unknown"
@@ -402,7 +440,10 @@ private class FixedFrameRateVideoPipeline(
             "\"timestamp_regression_count\":$timestampRegressionCount," +
             "\"gop_violation_count\":$gopViolationCount," +
             "\"selected_mean_fps\":${"%.4f".format(java.util.Locale.ROOT, selectedMeanRateHz)}," +
-            "\"selected_max_gap_ns\":$selectedMaxGapNs" +
+            "\"selected_max_gap_ns\":$selectedMaxGapNs," +
+            "\"stage_max_ns\":${stageMax.toJson()}," +
+            "\"io_max_queued_jobs\":${stageMax.ioMaxQueuedJobs}," +
+            "\"io_queue_capacity\":${stageMax.ioQueueCapacity}" +
             "}"
     }
 
@@ -434,14 +475,36 @@ private class FixedFrameRateVideoPipeline(
         if (!recordingSessionActive) return@synchronized
         isRecording = false
 
+        var stopFailure: Throwable? = null
+        try {
+            // On the camera thread, so it follows the last encoder swap.
+            runOnWorkerBlocking("signal the end of the encoder input") {
+                try {
+                    codec?.signalEndOfInputStream()
+                } finally {
+                    endOfInputSignalled = true
+                }
+            }
+        } catch (failure: Throwable) {
+            stopFailure = failure
+            endOfInputSignalled = true
+        }
+        // The encoder output thread drains to end of stream, queues the last fragment and
+        // sidecar rows, waits until they are durable and closes both files. Joined here, on
+        // the caller, never on the camera thread.
+        val output = encoderOutputThread
+        output?.join(WORKER_TIMEOUT_SECONDS * 1_000L)
+        val outputStillRunning = output?.isAlive == true
+        if (outputStillRunning) {
+            stopFailure = stopFailure ?: IllegalStateException(
+                "Timed out waiting for the encoder output to become durable",
+            )
+        }
+
         runOnWorkerBlocking("stop fixed-rate recording") {
             try {
-                codec?.signalEndOfInputStream()
-                drainEncoder(endOfStream = true)
-                check(submittedFrameTimestamps.isEmpty()) {
-                    "Encoder finalized with ${submittedFrameTimestamps.size} unmatched frame timestamps"
-                }
-                flushFrameTimestampRows(force = true)
+                stopFailure?.let { throw it }
+                encoderOutputFailure?.let { throw IllegalStateException("Encoder output failed", it) }
                 exposureSelector.qualityOrNull()?.let { quality ->
                     selectedMeanRateHz = quality.meanRateHz
                     selectedMaxGapNs = quality.maxGapNs
@@ -453,14 +516,20 @@ private class FixedFrameRateVideoPipeline(
             } finally {
                 captureStatsActive = false
                 recordingSessionActive = false
-                closeFrameTimestampWriter()
+                // Kept while it still runs, so the next start refuses to share its state.
+                if (!outputStillRunning) encoderOutputThread = null
+                // The encoder output thread finished and closed both files; if it is still
+                // running it still owns them, so they are detached here, never closed under it.
+                mp4 = null
+                frameTimestampStream = null
                 releaseEncoderAndMuxer()
             }
             Log.i(
                 TAG,
                 "Stopped fixed-rate recording after $writtenFrameCount frames " +
                     "(fragment I/O: max queued $ioMaxQueuedFragments, slowest durable " +
-                    "${"%.1f".format(java.util.Locale.ROOT, ioMaxFragmentDurableNs / 1e6)} ms)",
+                    "${"%.1f".format(java.util.Locale.ROOT, ioMaxFragmentDurableNs / 1e6)} ms; " +
+                    "stage max ns ${stageMax.toJson()})",
             )
         }
     }
@@ -553,29 +622,42 @@ private class FixedFrameRateVideoPipeline(
             texture.setDefaultBufferSize(sourceWidth, sourceHeight)
             texture.setOnFrameAvailableListener({ availableTexture ->
                 if (isClosed) return@setOnFrameAvailableListener
+                // Camera thread: latch, select and render only. Draining the encoder and
+                // every file write happen on the encoder output and I/O threads.
+                val callbackStartNs = System.nanoTime()
+                val recording = isRecording
                 try {
                     makeCurrent(pbufferSurface)
                     availableTexture.updateTexImage()
+                    val latchedNs = System.nanoTime()
                     availableTexture.getTransformMatrix(textureTransform)
                     if (firstTextureTransform == null) {
                         firstTextureTransform = textureTransform.copyOf()
                     }
                     val surfaceTimestampNs = availableTexture.timestamp
-                    if (isRecording && selectExposure(surfaceTimestampNs)) {
+                    if (recording && selectExposure(surfaceTimestampNs)) {
+                        val renderStartNs = System.nanoTime()
                         renderEncoderFrame(surfaceTimestampNs)
+                        stageMax.encoderRender.record(System.nanoTime() - renderStartNs)
                     }
-                    if (isRecording) drainEncoder(endOfStream = false)
+                    if (recording) stageMax.updateTexImage.record(latchedNs - callbackStartNs)
                     else if (qrScanActive) grabQrFrame()
                 } catch (failure: Throwable) {
-                    // Only encoder/EGL failures reach here; sidecar bookkeeping is
-                    // counted, never thrown.
+                    // Only encoder/EGL failures reach here.
                     if (!isClosed) {
                         captureFailure = failure
                         isRecording = false
                         Log.e(TAG, "Unable to encode camera exposure", failure)
                     }
                 }
-                flushFrameTimestampRows(force = false)
+                if (recording) {
+                    val endNs = System.nanoTime()
+                    stageMax.cameraFrameCallback.record(endNs - callbackStartNs)
+                    if (lastFrameCallbackNs != 0L) {
+                        stageMax.cameraFrameInterval.record(callbackStartNs - lastFrameCallbackNs)
+                    }
+                    lastFrameCallbackNs = callbackStartNs
+                }
             }, worker)
         }
         cameraInputSurface = Surface(surfaceTexture)
@@ -625,10 +707,6 @@ private class FixedFrameRateVideoPipeline(
                 height = outputHeight,
                 frameRate = frameRate,
                 gopFrames = gopFrameCount,
-                // Worker thread: rows reach the OS before the fragment is queued.
-                onFragmentQueued = { writeFrameTimestampRowsToOs() },
-                // I/O thread, after the fragment's fsync: the sidecar's fsync covers those rows.
-                onFragmentDurable = { syncFrameTimestampSidecar() },
             )
             newCodec.start()
         } catch (failure: Throwable) {
@@ -671,19 +749,68 @@ private class FixedFrameRateVideoPipeline(
             "eglPresentationTimeANDROID failed"
         }
         check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
-        submittedFrameTimestamps.addLast(surfaceTimestampNs)
+        submittedFrameTimestamps.add(surfaceTimestampNs)
         submittedFrameCount++
         makeCurrent(pbufferSurface)
     }
 
-    private fun drainEncoder(endOfStream: Boolean) {
-        val activeCodec = codec ?: return
+    /**
+     * Encoder output thread, one per recording: drains the encoder until the camera thread
+     * signals the end of input, then queues the last fragment and the remaining sidecar rows,
+     * waits until they are durable, and closes both files. Never touches EGL.
+     */
+    private fun runEncoderOutput(
+        activeCodec: MediaCodec,
+        writer: FragmentedMp4Writer,
+        sidecar: FileOutputStream,
+    ) {
+        var failure: Throwable? = null
+        try {
+            while (true) {
+                val endOfInput = endOfInputSignalled
+                drainEncoder(activeCodec, writer, sidecar, endOfStream = endOfInput)
+                if (endOfInput) break
+            }
+            check(submittedFrameTimestamps.isEmpty()) {
+                "Encoder finalized with ${submittedFrameTimestamps.size} unmatched frame timestamps"
+            }
+            writer.queuePendingFragment()
+            queueFrameTimestampRows(writer, sidecar, force = true)
+        } catch (thrown: Throwable) {
+            failure = thrown
+            // Loud: the camera thread stops feeding this eye and stop reports the cause.
+            isRecording = false
+            Log.e(TAG, "Encoder output failed after $writtenFrameCount frames", thrown)
+        }
+        try {
+            writer.finish()
+        } catch (thrown: Throwable) {
+            failure = failure ?: thrown
+            Log.e(TAG, "Unable to finalize fragmented MP4", thrown)
+        } finally {
+            writer.close()
+            // finish()/close() ran every queued sidecar job, each already fsynced.
+            runCatching { sidecar.close() }
+                .onFailure { Log.e(TAG, "Unable to close frame timestamp sidecar", it) }
+            ioMaxQueuedFragments = maxOf(ioMaxQueuedFragments, writer.maxQueuedFragments)
+            ioMaxFragmentDurableNs = maxOf(ioMaxFragmentDurableNs, writer.maxFragmentDurableNs)
+            stageMax.recordWriter(writer)
+        }
+        encoderOutputFailure = failure
+    }
+
+    private fun drainEncoder(
+        activeCodec: MediaCodec,
+        writer: FragmentedMp4Writer,
+        sidecar: FileOutputStream,
+        endOfStream: Boolean,
+    ) {
         val deadlineMs = if (endOfStream) SystemClock.uptimeMillis() + EOS_TIMEOUT_MS else 0L
 
         while (true) {
             val outputIndex = activeCodec.dequeueOutputBuffer(
                 bufferInfo,
-                if (endOfStream) EOS_DEQUEUE_TIMEOUT_US else 0L,
+                if (endOfStream) EOS_DEQUEUE_TIMEOUT_US else OUTPUT_POLL_TIMEOUT_US,
             )
 
             when {
@@ -691,7 +818,6 @@ private class FixedFrameRateVideoPipeline(
                     if (!endOfStream || SystemClock.uptimeMillis() >= deadlineMs) return
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val writer = mp4 ?: error("MP4 writer is unavailable")
                     check(!writer.isStarted) { "Encoder output format changed twice" }
                     val format = activeCodec.outputFormat
                     writer.start(
@@ -700,6 +826,7 @@ private class FixedFrameRateVideoPipeline(
                     )
                 }
                 outputIndex >= 0 -> {
+                    val sampleStartNs = System.nanoTime()
                     val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
                         ?: error("Encoder output buffer $outputIndex is null")
 
@@ -708,7 +835,6 @@ private class FixedFrameRateVideoPipeline(
                     }
 
                     if (bufferInfo.size > 0) {
-                        val writer = mp4 ?: error("MP4 writer is unavailable")
                         check(writer.isStarted) { "Encoded sample arrived before the encoder format" }
                         val isSyncFrame =
                             bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
@@ -728,17 +854,23 @@ private class FixedFrameRateVideoPipeline(
 
                         // The writer stamps sample n at exactly n/frameRate, independent of
                         // any timestamp quantization performed by the hardware encoder.
+                        val queuedBefore = writer.durableSampleCount
                         writer.writeSample(outputBuffer, isSyncFrame)
-                        val surfaceTimestampNs = submittedFrameTimestamps.pollFirst()
+                        val surfaceTimestampNs = submittedFrameTimestamps.poll()
                             ?: error("Encoded sample has no source exposure timestamp")
                         pendingFrameTimestampRows.addLast(
                             PendingFrameTimestampRow(writtenFrameCount, surfaceTimestampNs),
                         )
                         writtenFrameCount++
+                        if (writer.durableSampleCount != queuedBefore) {
+                            // A fragment was just queued: its rows go behind it.
+                            queueFrameTimestampRows(writer, sidecar, force = false)
+                        }
                     }
 
                     val reachedEos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                     activeCodec.releaseOutputBuffer(outputIndex, false)
+                    stageMax.encoderOutput.record(System.nanoTime() - sampleStartNs)
                     if (reachedEos) return
                 }
             }
@@ -761,16 +893,16 @@ private class FixedFrameRateVideoPipeline(
         }
         codec = null
 
+        // Only a writer no recording used reaches here; a recording's encoder output thread
+        // finishes its own (see stopRecording).
         mp4?.let { writer ->
             runCatching { writer.finish() }
                 .onFailure { Log.e(TAG, "Unable to finalize fragmented MP4", it) }
             writer.close()
-            ioMaxQueuedFragments = maxOf(ioMaxQueuedFragments, writer.maxQueuedFragments)
-            ioMaxFragmentDurableNs = maxOf(ioMaxFragmentDurableNs, writer.maxFragmentDurableNs)
         }
         mp4 = null
-        submittedFrameTimestamps.clear()
-        pendingFrameTimestampRows.clear()
+        // submittedFrameTimestamps and pendingFrameTimestampRows belong to the encoder output
+        // thread while it runs; startRecording clears them before starting the next one.
     }
 
     // ── QR scan (pod setup): only while not recording, at most every QR_SCAN_INTERVAL_MS ──
@@ -977,58 +1109,53 @@ private class FixedFrameRateVideoPipeline(
                 position(0)
             }
 
-    private fun openFrameTimestampWriter(file: File) {
+    /**
+     * Camera thread, at start: opens (truncates) the sidecar and queues its header's write and
+     * fsync first on the recording's I/O queue, so it is durable before any fragment and a
+     * killed session that kept a fragment never leaves a 0-byte sidecar.
+     */
+    private fun openFrameTimestampWriter(file: File, writer: FragmentedMp4Writer): FileOutputStream {
         closeFrameTimestampWriter()
         file.parentFile?.mkdirs()
         val stream = FileOutputStream(file)
         frameTimestampStream = stream
-        frameTimestampWriter = BufferedWriter(OutputStreamWriter(stream, Charsets.UTF_8)).also { writer ->
-            writer.write(FRAME_TIMESTAMP_HEADER)
-            writer.newLine()
-        }
-        // The header is durable before the first frame, so a killed session never
-        // leaves a 0-byte sidecar.
-        syncFrameTimestampRows()
+        queueSidecarBytes(writer, stream, FrameTimestampSidecar.headerLine())
+        return stream
     }
 
     /**
-     * Worker thread, as each MP4 fragment is queued (once per GOP): writes every row whose
-     * capture result has arrived and flushes them to the OS. The I/O thread then fsyncs the
-     * fragment and, in [syncFrameTimestampSidecar], the sidecar, so after a kill the sidecar
-     * covers at least the frames the MP4 still holds, minus rows still waiting on their
-     * capture result.
+     * Encoder output thread: formats the rows of frames already in a queued fragment and
+     * queues their write + fsync behind that fragment, so a row is on disk only once its frame
+     * is. See [takeFrameTimestampRows] for rows still waiting on a capture result.
      */
-    private fun writeFrameTimestampRowsToOs() {
-        flushFrameTimestampRows(force = false)
-        try {
-            frameTimestampWriter?.flush()
-        } catch (failure: java.io.IOException) {
-            captureFailure = captureFailure ?: failure
-            Log.e(TAG, "Unable to write frame timestamp sidecar", failure)
-        }
+    private fun queueFrameTimestampRows(
+        writer: FragmentedMp4Writer,
+        sidecar: FileOutputStream,
+        force: Boolean,
+    ) {
+        val rows = takeFrameTimestampRows(force, queuedFrameCount = writer.durableSampleCount)
+        if (rows.isNotEmpty()) queueSidecarBytes(writer, sidecar, rows)
     }
 
-    /** I/O thread, after a fragment's fsync. [closeFrameTimestampWriter] waits for it first. */
-    private fun syncFrameTimestampSidecar() {
-        val stream = frameTimestampStream ?: return
-        try {
-            stream.fd.sync()
-        } catch (failure: java.io.IOException) {
-            captureFailure = captureFailure ?: failure
-            Log.e(TAG, "Unable to sync frame timestamp sidecar", failure)
-        }
-    }
-
-    /** Writes, flushes and fsyncs the sidecar on this thread; only for the header at open. */
-    private fun syncFrameTimestampRows() {
-        flushFrameTimestampRows(force = false)
-        val writer = frameTimestampWriter ?: return
-        try {
-            writer.flush()
-            frameTimestampStream?.fd?.sync()
-        } catch (failure: java.io.IOException) {
-            captureFailure = captureFailure ?: failure
-            Log.e(TAG, "Unable to sync frame timestamp sidecar", failure)
+    /**
+     * Queues an append + fsync of [text] on the I/O thread. A sidecar write failure is
+     * recorded and surfaced at stop, never thrown into the MP4's queue: losing sidecar rows
+     * must not stop the encoder.
+     */
+    private fun queueSidecarBytes(writer: FragmentedMp4Writer, stream: FileOutputStream, text: String) {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        writer.enqueueIo {
+            try {
+                val startNs = System.nanoTime()
+                stream.write(bytes)
+                val writtenNs = System.nanoTime()
+                stream.fd.sync()
+                stageMax.sidecarWrite.record(writtenNs - startNs)
+                stageMax.sidecarFsync.record(System.nanoTime() - writtenNs)
+            } catch (failure: java.io.IOException) {
+                captureFailure = captureFailure ?: failure
+                Log.e(TAG, "Unable to write frame timestamp sidecar", failure)
+            }
         }
     }
 
@@ -1044,67 +1171,62 @@ private class FixedFrameRateVideoPipeline(
     }
 
     /**
-     * Write sidecar rows in encoded order. Rows wait a bounded number of frames
-     * for their Camera2 result (results normally trail buffers by ~2 frames);
-     * a row whose result never arrives is written with -1 enrichment and
-     * counted, so one missing result can neither block nor lose the sidecar.
-     * With [force] (stop), stragglers get [CAPTURE_RESULT_TIMEOUT_MS] then the
-     * same treatment.
+     * Encoder output thread: the sidecar rows of frames already in a queued fragment
+     * (index < [queuedFrameCount]), in encoded order. Rows wait a bounded number of frames
+     * for their Camera2 result (results normally trail buffers by ~2 frames); a row whose
+     * result never arrives is written with -1 enrichment and counted, so one missing result
+     * can neither block nor lose the sidecar. With [force] (stop), stragglers get
+     * [CAPTURE_RESULT_TIMEOUT_MS] then the same treatment.
      */
-    private fun flushFrameTimestampRows(force: Boolean) {
-        val writer = frameTimestampWriter ?: return
+    private fun takeFrameTimestampRows(force: Boolean, queuedFrameCount: Long): String {
+        val rows = StringBuilder()
         var deadlineMs = if (force) SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS else 0L
-        try {
-            while (pendingFrameTimestampRows.isNotEmpty()) {
-                val pending = pendingFrameTimestampRows.first()
-                var capture = captureResults.remove(pending.surfaceTimestampNs)
-                if (capture == null) {
-                    val framesBehind = writtenFrameCount - pending.index
-                    if (!force && framesBehind < CAPTURE_RESULT_MAX_LAG_FRAMES) return
-                    if (force && SystemClock.uptimeMillis() < deadlineMs) {
-                        Thread.sleep(1L)
-                        continue
-                    }
-                    captureResultMissingCount++
-                    Log.w(
-                        TAG,
-                        "No Camera2 capture result for encoded exposure " +
-                            "${pending.surfaceTimestampNs} ns at frame ${pending.index}",
-                    )
-                    capture = CameraFrameTimestamp(
-                        captureFrameNumber = UNKNOWN,
-                        sensorTimestampNs = pending.surfaceTimestampNs,
-                        exposureTimeNs = UNKNOWN,
-                    )
-                    // The next straggler gets a fresh (short) grace period.
-                    if (force) deadlineMs = SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS
+        while (pendingFrameTimestampRows.isNotEmpty()) {
+            val pending = pendingFrameTimestampRows.first()
+            if (pending.index >= queuedFrameCount) break
+            var capture = captureResults.remove(pending.surfaceTimestampNs)
+            if (capture == null) {
+                val framesBehind = writtenFrameCount - pending.index
+                if (!force && framesBehind < CAPTURE_RESULT_MAX_LAG_FRAMES) break
+                if (force && SystemClock.uptimeMillis() < deadlineMs) {
+                    Thread.sleep(1L)
+                    continue
                 }
-                writer.write(
-                    "${pending.index},${capture.sensorTimestampNs},${capture.exposureTimeNs}," +
-                        "${capture.captureFrameNumber},${pending.surfaceTimestampNs},false",
+                captureResultMissingCount++
+                Log.w(
+                    TAG,
+                    "No Camera2 capture result for encoded exposure " +
+                        "${pending.surfaceTimestampNs} ns at frame ${pending.index}",
                 )
-                writer.newLine()
-                pendingFrameTimestampRows.removeFirst()
+                capture = CameraFrameTimestamp(
+                    captureFrameNumber = UNKNOWN,
+                    sensorTimestampNs = pending.surfaceTimestampNs,
+                    exposureTimeNs = UNKNOWN,
+                )
+                // The next straggler gets a fresh (short) grace period.
+                if (force) deadlineMs = SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS
             }
-        } catch (failure: java.io.IOException) {
-            // Losing sidecar rows must never stop the encoder; surface it at stop.
-            captureFailure = captureFailure ?: failure
-            Log.e(TAG, "Unable to write frame timestamp sidecar", failure)
+            FrameTimestampSidecar.appendRow(
+                rows,
+                index = pending.index,
+                sensorTimestampNs = capture.sensorTimestampNs,
+                exposureTimeNs = capture.exposureTimeNs,
+                captureFrameNumber = capture.captureFrameNumber,
+                surfaceTimestampNs = pending.surfaceTimestampNs,
+            )
+            pendingFrameTimestampRows.removeFirst()
         }
+        return rows.toString()
     }
 
+    /** Closes a sidecar no encoder output thread owns (a recording that never started). */
     private fun closeFrameTimestampWriter() {
-        // No sidecar fsync may still be queued on the MP4 writer's I/O thread once it closes.
         runCatching { mp4?.awaitDurable() }
             .onFailure { Log.e(TAG, "Unable to wait for queued MP4 fragments", it) }
-        frameTimestampWriter?.let { writer ->
-            runCatching {
-                writer.flush()
-                frameTimestampStream?.fd?.sync()
-                writer.close()
-            }.onFailure { Log.e(TAG, "Unable to finalize frame timestamp sidecar", it) }
+        frameTimestampStream?.let { stream ->
+            runCatching { stream.close() }
+                .onFailure { Log.e(TAG, "Unable to close frame timestamp sidecar", it) }
         }
-        frameTimestampWriter = null
         frameTimestampStream = null
     }
 
@@ -1138,6 +1260,8 @@ private class FixedFrameRateVideoPipeline(
         private const val WORKER_TIMEOUT_SECONDS = 15L
         private const val EOS_TIMEOUT_MS = 5_000L
         private const val EOS_DEQUEUE_TIMEOUT_US = 10_000L
+        // The encoder output thread's poll: bounds how late it notices the end of input.
+        private const val OUTPUT_POLL_TIMEOUT_US = 10_000L
         private const val CAPTURE_RESULT_TIMEOUT_MS = 500L
         private const val CAPTURE_RESULT_RETENTION_NS = 5_000_000_000L
         private const val CAPTURE_RESULT_MAX_LAG_FRAMES = 30L
@@ -1150,9 +1274,6 @@ private class FixedFrameRateVideoPipeline(
         private const val QR_SCAN_SIZE = 768
         private const val QR_SCAN_CROP = 0.6f
         private const val QR_SCAN_INTERVAL_MS = 200L
-        private const val FRAME_TIMESTAMP_HEADER =
-            "encoded_frame_index,sensor_timestamp_ns,exposure_time_ns," +
-                "capture_frame_number,surface_timestamp_ns,is_duplicate"
 
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
@@ -1190,6 +1311,74 @@ private data class CameraFrameTimestamp(
     val sensorTimestampNs: Long,
     val exposureTimeNs: Long,
 )
+
+/**
+ * Worst case of each recording stage, for `capture_report.stage_max_ns`. Each [Max] has one
+ * writer thread; values are read after stop.
+ */
+private class StageMaxima {
+    class Max {
+        @Volatile
+        var ns = 0L
+            private set
+
+        fun record(elapsedNs: Long) {
+            if (elapsedNs > ns) ns = elapsedNs
+        }
+
+        fun reset() {
+            ns = 0L
+        }
+    }
+
+    // Camera thread.
+    val cameraFrameCallback = Max()
+    val cameraFrameInterval = Max()
+    val updateTexImage = Max()
+    val encoderRender = Max()
+    // Encoder output thread.
+    val encoderOutput = Max()
+    // I/O thread.
+    val sidecarWrite = Max()
+    val sidecarFsync = Max()
+    @Volatile
+    var fragmentWriteNs = 0L
+    @Volatile
+    var fragmentFsyncNs = 0L
+    @Volatile
+    var ioMaxQueuedJobs = 0
+    @Volatile
+    var ioQueueCapacity = FragmentedMp4Writer.DEFAULT_IO_QUEUE_CAPACITY
+
+    fun reset() {
+        listOf(
+            cameraFrameCallback, cameraFrameInterval, updateTexImage, encoderRender,
+            encoderOutput, sidecarWrite, sidecarFsync,
+        ).forEach(Max::reset)
+        fragmentWriteNs = 0L
+        fragmentFsyncNs = 0L
+        ioMaxQueuedJobs = 0
+    }
+
+    fun recordWriter(writer: FragmentedMp4Writer) {
+        fragmentWriteNs = maxOf(fragmentWriteNs, writer.maxFragmentWriteNs)
+        fragmentFsyncNs = maxOf(fragmentFsyncNs, writer.maxFragmentSyncNs)
+        ioMaxQueuedJobs = maxOf(ioMaxQueuedJobs, writer.maxQueuedIoJobs)
+        ioQueueCapacity = writer.ioQueueCapacity
+    }
+
+    fun toJson(): String = "{" +
+        "\"camera_frame_callback\":${cameraFrameCallback.ns}," +
+        "\"camera_frame_interval\":${cameraFrameInterval.ns}," +
+        "\"update_tex_image\":${updateTexImage.ns}," +
+        "\"encoder_render\":${encoderRender.ns}," +
+        "\"encoder_output\":${encoderOutput.ns}," +
+        "\"fragment_write\":$fragmentWriteNs," +
+        "\"fragment_fsync\":$fragmentFsyncNs," +
+        "\"sidecar_write\":${sidecarWrite.ns}," +
+        "\"sidecar_fsync\":${sidecarFsync.ns}" +
+        "}"
+}
 
 private data class PendingFrameTimestampRow(
     val index: Long,
