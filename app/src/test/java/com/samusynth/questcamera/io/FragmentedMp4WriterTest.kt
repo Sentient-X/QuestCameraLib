@@ -11,6 +11,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -145,7 +147,6 @@ class FragmentedMp4WriterTest {
         var durableOnCaller = false
         val writer = FragmentedMp4Writer(
             file, 128, 128, 30,
-            onFragmentQueued = { events.add("queued") },
             onFragmentDurable = {
                 if (Thread.currentThread() === callerThread) durableOnCaller = true
                 Thread.sleep(300)
@@ -155,15 +156,22 @@ class FragmentedMp4WriterTest {
         writer.start(stream.sps, stream.pps)
         val startNs = System.nanoTime()
         // Frame 60 queues the second fragment while the first one's 300 ms "fsync" still runs.
-        stream.frames.take(90).forEach { (data, sync) -> writer.writeSample(ByteBuffer.wrap(data), sync) }
+        // After each cut the caller queues a job (the pipeline's sidecar rows) behind it.
+        stream.frames.take(90).forEach { (data, sync) ->
+            val queuedBefore = writer.durableSampleCount
+            writer.writeSample(ByteBuffer.wrap(data), sync)
+            if (writer.durableSampleCount != queuedBefore) writer.enqueueIo { events.add("rows") }
+        }
         val feedMs = (System.nanoTime() - startNs) / 1_000_000
         assertTrue("feeding 90 frames took $feedMs ms behind a 300 ms fsync", feedMs < 250)
+        writer.queuePendingFragment()
+        writer.enqueueIo { events.add("rows") }
         writer.finish()
         assertTrue("onFragmentDurable ran on the caller's thread", !durableOnCaller)
-        assertEquals(listOf("queued", "queued", "queued"), events.filter { it == "queued" })
-        assertEquals(6, events.size)
-        assertEquals("queued", events.first())
+        // Every job queued after a fragment runs only once that fragment is durable.
+        assertEquals(listOf("durable", "rows", "durable", "rows", "durable", "rows"), events.toList())
         assertTrue(writer.maxQueuedFragments >= 2)
+        assertTrue(writer.maxQueuedIoJobs >= 2)
         assertTrue(writer.maxFragmentDurableNs >= 300_000_000L)
         assertEquals(listOf("ftyp", "moov", "moof", "mdat", "moof", "mdat", "moof", "mdat"), topLevelBoxes(file))
         ffprobeFrames(file)?.let { (frames, duration) ->
@@ -189,6 +197,52 @@ class FragmentedMp4WriterTest {
         assertTrue("expected an IOException, got $thrown", thrown is java.io.IOException)
         assertTrue(runCatching { writer.finish() }.exceptionOrNull() is java.io.IOException)
     }
+
+    @Test
+    fun bytesAreIdenticalToTheCallerThreadWriter() {
+        // Digests of the same fixture written by f66ab1e's writer, whose header was written
+        // and fsynced on the caller's thread: moving the header onto the I/O queue changes
+        // no byte.
+        val stream = loadFixture()
+        val clean = tmp.newFile("golden-clean.mp4")
+        write(clean, stream, 90, finish = true)
+        assertEquals("0c16291538fe4efc889fb6975b3a754d1d929cfdc8663cb7fc7087e9b4b77197", sha256(clean))
+        val killed = tmp.newFile("golden-killed.mp4")
+        write(killed, stream, 75, finish = false)
+        assertEquals("c8d6c8360c6ee1496af83750649a77349e66197454f3137ddd0f48d4d725d36c", sha256(killed))
+    }
+
+    @Test
+    fun storageThatFallsBehindFailsLoudlyWithoutBlockingTheCaller() {
+        val stream = loadFixture()
+        val file = tmp.newFile("behind.mp4")
+        val release = CountDownLatch(1)
+        // Capacity 2: the header runs, then a stalled first fragment holds the queue.
+        val writer = FragmentedMp4Writer(
+            file, 128, 128, 30,
+            onFragmentDurable = { release.await(10, TimeUnit.SECONDS) },
+            ioQueueCapacity = 2,
+        )
+        writer.start(stream.sps, stream.pps)
+        val frames = stream.frames + stream.frames + stream.frames // 270 frames, 9 GOPs
+        val startNs = System.nanoTime()
+        val thrown = runCatching {
+            frames.forEach { (data, sync) -> writer.writeSample(ByteBuffer.wrap(data), sync) }
+        }.exceptionOrNull()
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+        assertTrue("expected BacklogExceeded, got $thrown", thrown is DurableIoQueue.BacklogExceeded)
+        assertTrue("the caller waited $elapsedMs ms on stalled storage", elapsedMs < 250)
+        release.countDown()
+        assertTrue(runCatching { writer.finish() }.exceptionOrNull() is DurableIoQueue.BacklogExceeded)
+        writer.close()
+        // Every fragment the queue accepted is on disk and complete; none after the refusal.
+        val boxes = topLevelBoxes(file)
+        assertTrue("boxes $boxes", boxes.take(2) == listOf("ftyp", "moov") && "torn" !in boxes)
+        assertEquals(writer.durableSampleCount.toInt() / 30, boxes.count { it == "moof" })
+    }
+
+    private fun sha256(file: File): String =
+        MessageDigest.getInstance("SHA-256").digest(file.readBytes()).joinToString("") { "%02x".format(it) }
 
     /** (decoded frame count, format duration) via ffprobe, or null when ffprobe is absent. */
     private fun ffprobeFrames(file: File): Pair<Int, Double>? {
