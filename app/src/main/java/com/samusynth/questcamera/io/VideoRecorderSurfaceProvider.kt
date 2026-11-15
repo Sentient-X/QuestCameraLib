@@ -1175,12 +1175,14 @@ private class FixedFrameRateVideoPipeline(
      * (index < [queuedFrameCount]), in encoded order. Rows wait a bounded number of frames
      * for their Camera2 result (results normally trail buffers by ~2 frames); a row whose
      * result never arrives is written with -1 enrichment and counted, so one missing result
-     * can neither block nor lose the sidecar. With [force] (stop), stragglers get
-     * [CAPTURE_RESULT_TIMEOUT_MS] then the same treatment.
+     * can neither block nor lose the sidecar. With [force] (stop), the stragglers share one
+     * [CAPTURE_RESULT_TIMEOUT_MS] grace, then the same treatment: a fresh grace per straggler
+     * made a stop whose results had stopped arriving wait 500 ms per pending row (pod5
+     * 2026-11-15, right eye: five rows, 2.5 s of a 7.5 s stop).
      */
     private fun takeFrameTimestampRows(force: Boolean, queuedFrameCount: Long): String {
         val rows = StringBuilder()
-        var deadlineMs = if (force) SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS else 0L
+        val deadlineMs = if (force) SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS else 0L
         while (pendingFrameTimestampRows.isNotEmpty()) {
             val pending = pendingFrameTimestampRows.first()
             if (pending.index >= queuedFrameCount) break
@@ -1203,8 +1205,6 @@ private class FixedFrameRateVideoPipeline(
                     sensorTimestampNs = pending.surfaceTimestampNs,
                     exposureTimeNs = UNKNOWN,
                 )
-                // The next straggler gets a fresh (short) grace period.
-                if (force) deadlineMs = SystemClock.uptimeMillis() + CAPTURE_RESULT_TIMEOUT_MS
             }
             FrameTimestampSidecar.appendRow(
                 rows,
