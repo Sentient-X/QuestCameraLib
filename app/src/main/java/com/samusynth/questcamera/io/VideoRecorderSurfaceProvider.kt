@@ -27,7 +27,6 @@ import java.nio.FloatBuffer
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -125,28 +124,51 @@ class VideoRecorderSurfaceProvider(
         exposureTimeNs: Long,
     ) = pipeline.onCaptureResult(frameNumber, sensorTimestampNs, exposureTimeNs)
 
-    fun updateOutputFile(path: String, frameTimestampPath: String) =
+    // Every method Unity calls through JNI declares its return type: an expression body infers
+    // it, and stopRecording's inferred Unit? compiled to ()Lkotlin/Unit; in a6e6bd3, so OQC's
+    // Call("stopRecording") (()V) found no method at the first stop on pod5 (build 75, sx#4210).
+    // UnityJniAbiTest holds each descriptor OQC calls.
+    fun updateOutputFile(path: String, frameTimestampPath: String): Unit {
         pipeline.updateOutputFiles(path, frameTimestampPath)
+    }
 
-    fun startRecording() = pipeline.startRecording()
+    fun startRecording(): Unit {
+        pipeline.startRecording()
+    }
 
     /** Pod setup's Scan QR: decode QR codes from this camera's frames while not recording. */
-    fun startQrScan() = pipeline.startQrScan()
+    fun startQrScan(): Unit {
+        pipeline.startQrScan()
+    }
 
-    fun stopQrScan() = pipeline.stopQrScan()
+    fun stopQrScan(): Unit {
+        pipeline.stopQrScan()
+    }
 
     /** The first QR text decoded since [startQrScan], or "" (null does not cross JNI cleanly). */
     fun getQrResult(): String = pipeline.qrResult() ?: ""
 
-    fun requestStopRecording() = pipeline.requestStopRecording()
+    fun requestStopRecording(): Unit {
+        pipeline.requestStopRecording()
+    }
 
-    fun stopRecording() = pipeline.stopRecording()
+    fun stopRecording(): Unit {
+        pipeline.stopRecording()
+    }
 
     fun getSourceFrameCount(): Long = pipeline.sourceFrameCount()
 
     fun getSourceDroppedFrameCount(): Long = pipeline.sourceDroppedFrameCount()
 
     fun getSelectedFrameCount(): Long = pipeline.selectedFrameCount()
+
+    /**
+     * The first failure that ended (or is ending) this recording, with every cause, as soon as
+     * it happens on any recorder thread; "" while the recording is healthy (null does not
+     * cross JNI cleanly). [stopRecording] still finalizes what was recorded and then throws
+     * this same failure.
+     */
+    fun getCaptureError(): String = pipeline.captureError() ?: ""
 
     /** JSON object of capture-quality counters for the recording metadata sidecar. */
     fun getCaptureReportJson(): String = pipeline.captureReportJson()
@@ -161,7 +183,9 @@ class VideoRecorderSurfaceProvider(
      */
     fun getStreamGeometryJson(): String = pipeline.streamGeometryJson()
 
-    override fun close() = pipeline.close()
+    override fun close(): Unit {
+        pipeline.close()
+    }
 
     companion object {
         private const val CAPTURE_CONTRACT_FRAME_RATE = 30
@@ -253,8 +277,8 @@ private class FixedFrameRateVideoPipeline(
     @Volatile
     private var writtenFrameCount = 0L
     private val exposureSelector = ExposureFrameSelector(frameRate)
-    // Camera thread appends after each encoder swap; the encoder output thread polls.
-    private val submittedFrameTimestamps = ConcurrentLinkedQueue<Long>()
+    // Camera thread publishes before each encoder swap; the encoder output thread takes.
+    private val frameHandoff = EncoderFrameHandoff()
     private val pendingFrameTimestampRows = ArrayDeque<PendingFrameTimestampRow>()
     // Opened on the camera thread at start; written, fsynced and closed on the I/O and
     // encoder output threads (see runEncoderOutput).
@@ -267,6 +291,10 @@ private class FixedFrameRateVideoPipeline(
     private var endOfInputSignalled = false
     @Volatile
     private var encoderOutputFailure: Throwable? = null
+    // The first failure of this recording on any thread, reported when it happens.
+    private val firstFailure = AtomicReference<Throwable?>()
+    @Volatile
+    private var firstFailureText: String? = null
     // Durability evidence: the I/O queue's worst backlog and slowest fragment write + fsync.
     @Volatile
     private var ioMaxQueuedFragments = 0
@@ -360,9 +388,11 @@ private class FixedFrameRateVideoPipeline(
             }
             submittedFrameCount = 0L
             writtenFrameCount = 0L
-            submittedFrameTimestamps.clear()
+            frameHandoff.clear()
             pendingFrameTimestampRows.clear()
             captureFailure = null
+            firstFailure.set(null)
+            firstFailureText = null
             val sourceRateHz = measureSourceRateHz()
             observedSourceRateHz = sourceRateHz
             // An unmeasured source is not a slow one: the session requests
@@ -416,6 +446,23 @@ private class FixedFrameRateVideoPipeline(
     }
 
     fun sourceFrameCount(): Long = synchronized(captureStatsLock) { sourceFrameCount }
+
+    fun captureError(): String? = firstFailureText
+
+    /**
+     * Records [failure] as this recording's failure if it is the first, and says so in the log
+     * at once, with its causes, so the app can end the episode instead of learning it at stop.
+     */
+    private fun reportFailure(stage: String, failure: Throwable) {
+        val described = IllegalStateException(
+            "$stage after $writtenFrameCount frames: ${CaptureFailure.describe(failure)}",
+            failure,
+        )
+        if (firstFailure.compareAndSet(null, described)) {
+            firstFailureText = described.message
+            Log.e(TAG, "Capture failed: ${described.message}", failure)
+        }
+    }
 
     fun sourceDroppedFrameCount(): Long =
         synchronized(captureStatsLock) { sourceDroppedFrameCount }
@@ -501,18 +548,28 @@ private class FixedFrameRateVideoPipeline(
             )
         }
 
+        // Finalizing always runs; a failure is thrown after it, as itself (the first one the
+        // recording reported, with its causes), never wrapped in a stop failure.
+        var finalFailure: Throwable? = null
         runOnWorkerBlocking("stop fixed-rate recording") {
             try {
-                stopFailure?.let { throw it }
-                encoderOutputFailure?.let { throw IllegalStateException("Encoder output failed", it) }
+                stopFailure?.let { reportFailure("Stop failed", it) }
+                encoderOutputFailure?.let { reportFailure("Encoder output failed", it) }
+                captureFailure?.let { reportFailure("Camera exposure capture failed", it) }
                 exposureSelector.qualityOrNull()?.let { quality ->
                     selectedMeanRateHz = quality.meanRateHz
                     selectedMaxGapNs = quality.maxGapNs
-                    check(quality.frameCount == writtenFrameCount) {
-                        "Selected ${quality.frameCount} exposures but encoded $writtenFrameCount frames"
+                    if (quality.frameCount != writtenFrameCount) {
+                        reportFailure(
+                            "Stop found the encoder short",
+                            IllegalStateException(
+                                "Selected ${quality.frameCount} exposures but encoded " +
+                                    "$writtenFrameCount frames",
+                            ),
+                        )
                     }
                 }
-                captureFailure?.let { throw IllegalStateException("Camera exposure capture failed", it) }
+                finalFailure = firstFailure.get()
             } finally {
                 captureStatsActive = false
                 recordingSessionActive = false
@@ -532,6 +589,7 @@ private class FixedFrameRateVideoPipeline(
                     "stage max ns ${stageMax.toJson()})",
             )
         }
+        finalFailure?.let { throw it }
     }
 
     override fun close() = synchronized(stateLock) {
@@ -647,7 +705,7 @@ private class FixedFrameRateVideoPipeline(
                     if (!isClosed) {
                         captureFailure = failure
                         isRecording = false
-                        Log.e(TAG, "Unable to encode camera exposure", failure)
+                        reportFailure("Unable to encode camera exposure", failure)
                     }
                 }
                 if (recording) {
@@ -748,8 +806,11 @@ private class FixedFrameRateVideoPipeline(
         check(EGLExt.eglPresentationTimeANDROID(eglDisplay, encoderEglSurface, presentationNs)) {
             "eglPresentationTimeANDROID failed"
         }
-        check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
-        submittedFrameTimestamps.add(surfaceTimestampNs)
+        // The exposure is published before the swap: the encoder can emit this frame on the
+        // output thread before eglSwapBuffers returns.
+        frameHandoff.submit(surfaceTimestampNs) {
+            check(EGL14.eglSwapBuffers(eglDisplay, encoderEglSurface)) { "Encoder eglSwapBuffers failed" }
+        }
         submittedFrameCount++
         makeCurrent(pbufferSurface)
     }
@@ -771,8 +832,8 @@ private class FixedFrameRateVideoPipeline(
                 drainEncoder(activeCodec, writer, sidecar, endOfStream = endOfInput)
                 if (endOfInput) break
             }
-            check(submittedFrameTimestamps.isEmpty()) {
-                "Encoder finalized with ${submittedFrameTimestamps.size} unmatched frame timestamps"
+            check(frameHandoff.pendingCount == 0) {
+                "Encoder finalized with ${frameHandoff.pendingCount} unmatched frame timestamps"
             }
             writer.queuePendingFragment()
             queueFrameTimestampRows(writer, sidecar, force = true)
@@ -780,7 +841,7 @@ private class FixedFrameRateVideoPipeline(
             failure = thrown
             // Loud: the camera thread stops feeding this eye and stop reports the cause.
             isRecording = false
-            Log.e(TAG, "Encoder output failed after $writtenFrameCount frames", thrown)
+            reportFailure("Encoder output failed", thrown)
         }
         try {
             writer.finish()
@@ -854,10 +915,10 @@ private class FixedFrameRateVideoPipeline(
 
                         // The writer stamps sample n at exactly n/frameRate, independent of
                         // any timestamp quantization performed by the hardware encoder.
+                        val surfaceTimestampNs = frameHandoff.takeForEncodedSample()
+                            ?: error("Encoded sample has no source exposure timestamp")
                         val queuedBefore = writer.durableSampleCount
                         writer.writeSample(outputBuffer, isSyncFrame)
-                        val surfaceTimestampNs = submittedFrameTimestamps.poll()
-                            ?: error("Encoded sample has no source exposure timestamp")
                         pendingFrameTimestampRows.addLast(
                             PendingFrameTimestampRow(writtenFrameCount, surfaceTimestampNs),
                         )
@@ -901,7 +962,7 @@ private class FixedFrameRateVideoPipeline(
             writer.close()
         }
         mp4 = null
-        // submittedFrameTimestamps and pendingFrameTimestampRows belong to the encoder output
+        // frameHandoff and pendingFrameTimestampRows belong to the encoder output
         // thread while it runs; startRecording clears them before starting the next one.
     }
 
@@ -1154,7 +1215,7 @@ private class FixedFrameRateVideoPipeline(
                 stageMax.sidecarFsync.record(System.nanoTime() - writtenNs)
             } catch (failure: java.io.IOException) {
                 captureFailure = captureFailure ?: failure
-                Log.e(TAG, "Unable to write frame timestamp sidecar", failure)
+                reportFailure("Unable to write frame timestamp sidecar", failure)
             }
         }
     }
@@ -1251,7 +1312,9 @@ private class FixedFrameRateVideoPipeline(
         check(finished.await(WORKER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
             "Timed out waiting to $operation"
         }
-        failure.get()?.let { throw IllegalStateException("Failed to $operation", it) }
+        failure.get()?.let {
+            throw IllegalStateException("Failed to $operation: ${CaptureFailure.describe(it)}", it)
+        }
     }
 
     companion object {
