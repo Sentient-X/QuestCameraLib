@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The on-device camera gate (OQC scripts/device_smoke.sh, sx#4210): the test APK records both
+     passthrough cameras, so it asks for them as OpenQuestCapture does, and holds a plain activity
+     in front while it records (the camera service refuses an app with nothing on screen). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
+    <application>
+        <activity
+            android:name="com.samusynth.questcamera.io.CameraGateActivity"
+            android:exported="false" />
+    </application>
+</manifest>

@@ -124,22 +124,37 @@ class VideoRecorderSurfaceProvider(
         exposureTimeNs: Long,
     ) = pipeline.onCaptureResult(frameNumber, sensorTimestampNs, exposureTimeNs)
 
-    fun updateOutputFile(path: String, frameTimestampPath: String) =
+    // Every method Unity calls through JNI declares its return type: an expression body infers
+    // it, and stopRecording's inferred Unit? compiled to ()Lkotlin/Unit; in a6e6bd3, so OQC's
+    // Call("stopRecording") (()V) found no method at the first stop on pod5 (build 75, sx#4210).
+    // UnityJniAbiTest holds each descriptor OQC calls.
+    fun updateOutputFile(path: String, frameTimestampPath: String): Unit {
         pipeline.updateOutputFiles(path, frameTimestampPath)
+    }
 
-    fun startRecording() = pipeline.startRecording()
+    fun startRecording(): Unit {
+        pipeline.startRecording()
+    }
 
     /** Pod setup's Scan QR: decode QR codes from this camera's frames while not recording. */
-    fun startQrScan() = pipeline.startQrScan()
+    fun startQrScan(): Unit {
+        pipeline.startQrScan()
+    }
 
-    fun stopQrScan() = pipeline.stopQrScan()
+    fun stopQrScan(): Unit {
+        pipeline.stopQrScan()
+    }
 
     /** The first QR text decoded since [startQrScan], or "" (null does not cross JNI cleanly). */
     fun getQrResult(): String = pipeline.qrResult() ?: ""
 
-    fun requestStopRecording() = pipeline.requestStopRecording()
+    fun requestStopRecording(): Unit {
+        pipeline.requestStopRecording()
+    }
 
-    fun stopRecording() = pipeline.stopRecording()
+    fun stopRecording(): Unit {
+        pipeline.stopRecording()
+    }
 
     fun getSourceFrameCount(): Long = pipeline.sourceFrameCount()
 
@@ -168,7 +183,9 @@ class VideoRecorderSurfaceProvider(
      */
     fun getStreamGeometryJson(): String = pipeline.streamGeometryJson()
 
-    override fun close() = pipeline.close()
+    override fun close(): Unit {
+        pipeline.close()
+    }
 
     companion object {
         private const val CAPTURE_CONTRACT_FRAME_RATE = 30
