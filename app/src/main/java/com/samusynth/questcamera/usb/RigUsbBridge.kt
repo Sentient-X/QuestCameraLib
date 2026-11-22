@@ -34,6 +34,12 @@ import com.samusynth.questcamera.helper.CameraPermissionRequestActivity
  *
  * Every broadcast only triggers a re-enumeration from [UsbManager]; intent extras are never
  * trusted, so a spoofed broadcast cannot attach or drop a device.
+ *
+ * The bus is witnessed ([BusWitness]): each rig device's departure and return is timed and
+ * logged (`adb logcat -s RigUsbBridge`: `left the bus` / `back on the bus after N ms`) and the
+ * last events ride in the snapshot's `bus` record, so a take that died `device disconnected`
+ * (OQC #44, Pod 12's 22 of 23) can be laid beside the bus: a departure during the take is the
+ * cable, hub port or camera; none behind the words would be the software's.
  */
 class RigUsbBridge(context: Context) : AutoCloseable {
     private val appContext = context.applicationContext
@@ -50,6 +56,7 @@ class RigUsbBridge(context: Context) : AutoCloseable {
     private val permissionAsk = PermissionAsk(
         usbManager.deviceList.values.filter { isRigDevice(it.vendorId, it.productId) }.map(::keyOf).toSet()
     )
+    private val witness = BusWitness()
     private var lastError: String? = null
     private var closed = false
 
@@ -92,6 +99,7 @@ class RigUsbBridge(context: Context) : AutoCloseable {
             if (key !in presentKeys) gone[key] = open.remove(key)!!
         }
         permissionAsk.retain(presentKeys)
+        witnessLocked(present)
 
         for (device in present) {
             val key = keyOf(device)
@@ -122,8 +130,11 @@ class RigUsbBridge(context: Context) : AutoCloseable {
     /**
      * The current snapshot without re-enumerating:
      * `{"devices":[{"key","deviceName","vendorId","productId","fd","serial"}],
-     *   "present":N, "awaitingPermission":[deviceName...], "pendingRelease":[key...], "error":...}`.
-     * `present` counts rig devices on the bus, permitted or not.
+     *   "present":N, "awaitingPermission":[deviceName...], "pendingRelease":[key...], "error":...,
+     *   "bus":{"detachments":N, "missing":[key...], "events":[{"kind","key","deviceName","vendorId",
+     *   "productId","serial","atElapsedMs","atEpochMs","afterMs"}]}}`.
+     * `present` counts rig devices on the bus, permitted or not; `bus` is the [BusWitness] record
+     * (unknown to Unity's `JsonUtility` reader until it asks for it, and harmless to it).
      */
     fun snapshotJson(): String = synchronized(lock) {
         snapshotJsonLocked(usbManager.deviceList.values.filter { isRigDevice(it.vendorId, it.productId) })
@@ -143,6 +154,40 @@ class RigUsbBridge(context: Context) : AutoCloseable {
         (open.values + gone.values).forEach { runCatching { it.connection.close() } }
         open.clear()
         gone.clear()
+    }
+
+    /** Time every departure and return against the bus; the serial is the open connection's, read once. */
+    private fun witnessLocked(present: List<UsbDevice>) {
+        val now = present.associate { device ->
+            keyOf(device) to BusWitness.Identity(
+                device.vendorId, device.productId, device.deviceName, open[keyOf(device)]?.serial
+            )
+        }
+        for (event in witness.observe(now, SystemClock.elapsedRealtime(), System.currentTimeMillis())) {
+            val device = event.device
+            val what = "%04x:%04x at %s serial=%s".format(device.vendorId, device.productId, device.deviceName, device.serial)
+            when (event.kind) {
+                BusWitness.Kind.DETACHED -> Log.w(TAG, "left the bus: $what (departure ${witness.detachments()} since launch)")
+                BusWitness.Kind.ATTACHED -> Log.i(
+                    TAG,
+                    event.afterMs?.let { "back on the bus after $it ms: $what" } ?: "on the bus: $what"
+                )
+            }
+        }
+    }
+
+    private fun busJsonLocked(): String {
+        val events = witness.events().joinToString(",", "[", "]") { event ->
+            "{\"kind\":${quote(event.kind.name.lowercase())},\"key\":${quote(event.key)}," +
+                "\"deviceName\":${quote(event.device.deviceName)}," +
+                "\"vendorId\":${event.device.vendorId},\"productId\":${event.device.productId}," +
+                "\"serial\":${event.device.serial?.let(::quote) ?: "null"}," +
+                "\"atElapsedMs\":${event.atElapsedMs},\"atEpochMs\":${event.atEpochMs}," +
+                "\"afterMs\":${event.afterMs ?: "null"}}"
+        }
+        return "{\"detachments\":${witness.detachments()}," +
+            "\"missing\":${witness.missing().joinToString(",", "[", "]") { quote(it.key) }}," +
+            "\"events\":$events}"
     }
 
     private fun requestPermission(device: UsbDevice) {
@@ -166,7 +211,8 @@ class RigUsbBridge(context: Context) : AutoCloseable {
             "\"usbCameraPermission\":${CameraPermissionRequestActivity.hasUsbCameraPermissions(appContext)}," +
             "\"awaitingPermission\":${awaiting.joinToString(",", "[", "]") { quote(it) }}," +
             "\"pendingRelease\":${gone.keys.joinToString(",", "[", "]") { quote(it) }}," +
-            "\"error\":${lastError?.let(::quote) ?: "null"}}"
+            "\"error\":${lastError?.let(::quote) ?: "null"}," +
+            "\"bus\":${busJsonLocked()}}"
     }
 
     companion object {
