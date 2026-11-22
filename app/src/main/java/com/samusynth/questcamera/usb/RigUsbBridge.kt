@@ -9,6 +9,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.hardware.usb.UsbConstants
 import com.samusynth.questcamera.helper.CameraPermissionRequestActivity
@@ -27,8 +28,9 @@ import com.samusynth.questcamera.helper.CameraPermissionRequestActivity
  *
  * Permission: the manifest's `USB_DEVICE_ATTACHED` filter with `@xml/device_filter` makes
  * the app the device's default handler once "always open" is chosen, after which plugging a
- * device grants permission with no prompt. A device present without permission is asked for
- * once per attachment ([UsbManager.requestPermission]) and never re-prompted in a loop.
+ * device grants permission with no prompt. A plugged device is the system's to grant or to
+ * prompt for; the bridge asks ([UsbManager.requestPermission]) only once that has not happened,
+ * and at most once per attachment ([PermissionAsk]).
  *
  * Every broadcast only triggers a re-enumeration from [UsbManager]; intent extras are never
  * trusted, so a spoofed broadcast cannot attach or drop a device.
@@ -44,8 +46,10 @@ class RigUsbBridge(context: Context) : AutoCloseable {
     private val open = HashMap<String, Held>()
     /** Open connections whose device is gone, awaiting [release] after the native detach. */
     private val gone = HashMap<String, Held>()
-    /** Attachment keys already asked for permission. */
-    private val permissionRequested = HashSet<String>()
+    /** When to ask for an unpermitted attachment ourselves; seeded with what is on the bus now. */
+    private val permissionAsk = PermissionAsk(
+        usbManager.deviceList.values.filter { isRigDevice(it.vendorId, it.productId) }.map(::keyOf).toSet()
+    )
     private var lastError: String? = null
     private var closed = false
 
@@ -87,7 +91,7 @@ class RigUsbBridge(context: Context) : AutoCloseable {
         for (key in open.keys.toList()) {
             if (key !in presentKeys) gone[key] = open.remove(key)!!
         }
-        permissionRequested.retainAll(presentKeys)
+        permissionAsk.retain(presentKeys)
 
         for (device in present) {
             val key = keyOf(device)
@@ -97,7 +101,9 @@ class RigUsbBridge(context: Context) : AutoCloseable {
                 // USB_CAMERA; asking before they are granted would spend the one request.
                 val blocked = isVideoDevice(device) &&
                     !CameraPermissionRequestActivity.hasUsbCameraPermissions(appContext)
-                if (!blocked && permissionRequested.add(key)) requestPermission(device)
+                if (!blocked && permissionAsk.shouldAsk(key, SystemClock.elapsedRealtime())) {
+                    requestPermission(device)
+                }
                 continue
             }
             val connection = usbManager.openDevice(device)
