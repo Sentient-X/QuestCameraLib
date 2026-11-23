@@ -287,8 +287,9 @@ private class FixedFrameRateVideoPipeline(
     @Volatile
     private var captureFailure: Throwable? = null
     private var encoderOutputThread: Thread? = null
-    @Volatile
-    private var endOfInputSignalled = false
+    // Camera thread signals the end of input; the encoder output thread records the end of
+    // stream and decides each pass from both (see runEncoderOutput).
+    private val drainState = EncoderDrainState()
     @Volatile
     private var encoderOutputFailure: Throwable? = null
     // The first failure of this recording on any thread, reported when it happens.
@@ -422,7 +423,7 @@ private class FixedFrameRateVideoPipeline(
             val activeCodec = codec ?: error("Encoder is not prepared")
             val writer = mp4 ?: error("MP4 writer is not prepared")
             val sidecar = openFrameTimestampWriter(frameTimestampFile, writer)
-            endOfInputSignalled = false
+            drainState.reset()
             encoderOutputFailure = null
             encoderOutputThread = Thread(
                 { runEncoderOutput(activeCodec, writer, sidecar) },
@@ -529,12 +530,12 @@ private class FixedFrameRateVideoPipeline(
                 try {
                     codec?.signalEndOfInputStream()
                 } finally {
-                    endOfInputSignalled = true
+                    drainState.signalEndOfInput()
                 }
             }
         } catch (failure: Throwable) {
             stopFailure = failure
-            endOfInputSignalled = true
+            drainState.signalEndOfInput()
         }
         // The encoder output thread drains to end of stream, queues the last fragment and
         // sidecar rows, waits until they are durable and closes both files. Joined here, on
@@ -816,9 +817,14 @@ private class FixedFrameRateVideoPipeline(
     }
 
     /**
-     * Encoder output thread, one per recording: drains the encoder until the camera thread
-     * signals the end of input, then queues the last fragment and the remaining sidecar rows,
-     * waits until they are durable, and closes both files. Never touches EGL.
+     * Encoder output thread, one per recording: drains the encoder until its end-of-stream
+     * buffer is dequeued (the camera thread signals the end of input at stop), then queues the
+     * last fragment and the remaining sidecar rows, waits until they are durable, and closes
+     * both files. Never touches EGL.
+     *
+     * Each pass is decided by [EncoderDrainState]: the end of stream is usually dequeued by a
+     * poll that began before the end-of-input flag was set, and it ends the loop at once. Only
+     * an end of stream that never comes costs the bounded [EOS_TIMEOUT_MS] wait, once.
      */
     private fun runEncoderOutput(
         activeCodec: MediaCodec,
@@ -828,9 +834,23 @@ private class FixedFrameRateVideoPipeline(
         var failure: Throwable? = null
         try {
             while (true) {
-                val endOfInput = endOfInputSignalled
-                drainEncoder(activeCodec, writer, sidecar, endOfStream = endOfInput)
-                if (endOfInput) break
+                when (drainState.nextPass()) {
+                    EncoderDrainState.Pass.DONE -> break
+                    EncoderDrainState.Pass.POLL ->
+                        drainEncoder(activeCodec, writer, sidecar, endOfStream = false)
+                    EncoderDrainState.Pass.DRAIN_TO_END ->
+                        drainEncoder(activeCodec, writer, sidecar, endOfStream = true)
+                    EncoderDrainState.Pass.GIVE_UP -> {
+                        // Recorded, not fatal: what the encoder emitted is finalized as is.
+                        Log.w(
+                            TAG,
+                            "${outputFile.name}: the encoder sent no end of stream within " +
+                                "$EOS_TIMEOUT_MS ms of the end of input; finalizing " +
+                                "$writtenFrameCount frames",
+                        )
+                        break
+                    }
+                }
             }
             check(frameHandoff.pendingCount == 0) {
                 "Encoder finalized with ${frameHandoff.pendingCount} unmatched frame timestamps"
@@ -932,7 +952,10 @@ private class FixedFrameRateVideoPipeline(
                     val reachedEos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                     activeCodec.releaseOutputBuffer(outputIndex, false)
                     stageMax.encoderOutput.record(System.nanoTime() - sampleStartNs)
-                    if (reachedEos) return
+                    if (reachedEos) {
+                        drainState.reachEndOfStream()
+                        return
+                    }
                 }
             }
         }
